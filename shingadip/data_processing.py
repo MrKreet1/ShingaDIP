@@ -63,7 +63,10 @@ def parse_date_value(value: Any) -> pd.Timestamp | None:
     if not text:
         return None
 
-    parsed = pd.to_datetime(text, dayfirst=True, errors="coerce")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        parsed = pd.to_datetime(text, format="%Y-%m-%d", errors="coerce")
+    else:
+        parsed = pd.to_datetime(text, dayfirst=True, errors="coerce")
     if pd.isna(parsed):
         return None
     return parsed.normalize()

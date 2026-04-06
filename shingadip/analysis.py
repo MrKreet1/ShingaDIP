@@ -54,7 +54,14 @@ def detect_ml_anomalies(operations_df: pd.DataFrame) -> pd.DataFrame:
     if features.nunique().sum() <= len(features.columns):
         return scored
 
-    contamination = min(0.2, max(0.05, 2 / len(scored)))
+    if len(scored) >= 1000:
+        contamination = 0.01
+    elif len(scored) >= 250:
+        contamination = 0.015
+    elif len(scored) >= 75:
+        contamination = 0.02
+    else:
+        contamination = min(0.08, max(0.03, 2 / len(scored)))
     model = IsolationForest(random_state=42, contamination=contamination)
     predictions = model.fit_predict(features)
     anomaly_scores = -model.score_samples(features)
@@ -131,6 +138,7 @@ def analyze_operations(
     documents: list[DocumentExtraction] | None = None,
 ) -> pd.DataFrame:
     documents = documents or []
+    has_uploaded_documents = bool(documents)
     scored = detect_ml_anomalies(operations_df)
     duplicate_counts = scored["document_number"].fillna("").map(normalize_token).value_counts().to_dict()
     counterparty_counts = scored["counterparty"].fillna("не указан").value_counts(dropna=False).to_dict()
@@ -152,7 +160,7 @@ def analyze_operations(
         reasons: list[str] = []
         reason_codes: list[str] = []
         risk_score = 0
-        document_check_status = "NOT_PROVIDED" if not documents else "OK"
+        document_check_status = "NOT_PROVIDED" if not has_uploaded_documents else "OK"
 
         missing_fields = row.get("missing_required_fields", [])
         if missing_fields:
@@ -178,13 +186,7 @@ def analyze_operations(
             reasons.append("Сумма операции значительно выше типового диапазона.")
             risk_score += RISK_WEIGHTS["amount_outlier"]
 
-        counterparty = row.get("counterparty")
-        if counterparty and len(scored) >= 6 and counterparty_counts.get(counterparty, 0) == 1:
-            reason_codes.append("atypical_counterparty")
-            reasons.append("Контрагент встречается редко и требует дополнительной проверки.")
-            risk_score += RISK_WEIGHTS["atypical_counterparty"]
-
-        if matched_document is None and documents:
+        if matched_document is None and has_uploaded_documents:
             reason_codes.append("no_primary_document")
             reasons.append("Не найден подходящий первичный документ для сверки.")
             risk_score += RISK_WEIGHTS["no_primary_document"]
@@ -222,23 +224,60 @@ def analyze_operations(
         if bool(row.get("ml_anomaly_flag")):
             reason_codes.append("ml_anomaly")
             reasons.append("Модель аномалий отметила операцию как нетипичную относительно остальных записей.")
-            risk_score += int(RISK_WEIGHTS["ml_anomaly"] * float(row.get("ml_anomaly_strength", 0.0) or 0.0) + 6)
+            risk_score += int(RISK_WEIGHTS["ml_anomaly"] * float(row.get("ml_anomaly_strength", 0.0) or 0.0) + 4)
+
+        counterparty = row.get("counterparty")
+        rare_counterparty_support = {
+            "amount_outlier",
+            "missing_required_fields",
+            "no_primary_document",
+            "document_amount_mismatch",
+            "document_date_mismatch",
+            "document_counterparty_mismatch",
+            "ml_anomaly",
+        }
+        if (
+            counterparty
+            and len(scored) >= 20
+            and counterparty_counts.get(counterparty, 0) == 1
+            and rare_counterparty_support.intersection(reason_codes)
+        ):
+            reason_codes.append("atypical_counterparty")
+            reasons.append("Контрагент встречается редко и усиливает общий риск операции.")
+            risk_score += RISK_WEIGHTS["atypical_counterparty"]
+
+        compound_risk_factors = {
+            "missing_required_fields",
+            "amount_outlier",
+            "no_primary_document",
+            "document_amount_mismatch",
+            "document_date_mismatch",
+            "document_counterparty_mismatch",
+            "ml_anomaly",
+            "atypical_counterparty",
+        }
+        compound_count = len(compound_risk_factors.intersection(reason_codes))
+        if compound_count >= 4:
+            risk_score += 16
+        elif compound_count >= 3:
+            risk_score += 10
 
         if "document_amount_mismatch" in reason_codes:
             risk_score = max(risk_score, 45)
+        elif "no_primary_document" in reason_codes:
+            risk_score = max(risk_score, 30)
         elif {
             "document_date_mismatch",
             "document_counterparty_mismatch",
             "duplicate_document_number",
             "missing_required_fields",
-            "no_primary_document",
         }.intersection(reason_codes):
-            risk_score = max(risk_score, 35)
+            risk_score = max(risk_score, 30)
 
         risk_score = min(int(round(risk_score)), 100)
         if risk_score >= 70:
             status = "RISK"
-        elif risk_score >= 35:
+        elif risk_score >= 30:
             status = "WARNING"
         else:
             status = "OK"

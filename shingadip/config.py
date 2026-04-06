@@ -116,20 +116,19 @@ SUSPICIOUS_DESCRIPTION_KEYWORDS = [
 
 RISK_WEIGHTS = {
     "missing_required_fields": 18,
-    "duplicate_document_number": 22,
+    "duplicate_document_number": 18,
     "amount_outlier": 20,
-    "suspicious_description": 12,
-    "atypical_counterparty": 10,
-    "no_primary_document": 15,
+    "suspicious_description": 10,
+    "atypical_counterparty": 6,
+    "no_primary_document": 8,
     "document_amount_mismatch": 28,
-    "document_date_mismatch": 18,
-    "document_counterparty_mismatch": 18,
-    "document_incomplete": 8,
-    "ml_anomaly": 14,
+    "document_date_mismatch": 14,
+    "document_counterparty_mismatch": 14,
+    "document_incomplete": 6,
+    "ml_anomaly": 10,
 }
 
 
 def ensure_workspace() -> None:
     WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
-

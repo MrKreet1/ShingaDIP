@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -16,6 +17,9 @@ class AISettings:
     model: str = "qwen2.5-7b-instruct"
     timeout_seconds: int = 20
     max_rows: int = 8
+    use_vision_for_documents: bool = False
+    vision_model: str = "qwen2.5-vl-7b-instruct"
+    max_document_ai_calls: int = 10
 
 
 def discover_lm_studio_models(endpoint: str, timeout_seconds: int = 5) -> tuple[list[str], str | None]:
@@ -28,6 +32,64 @@ def discover_lm_studio_models(endpoint: str, timeout_seconds: int = 5) -> tuple[
         return models, None
     except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError, ValueError) as exc:
         return [], str(exc)
+
+
+def request_lm_studio_completion(
+    messages: list[dict[str, object]],
+    settings: AISettings,
+    *,
+    model: str | None = None,
+    temperature: float = 0.2,
+    max_tokens: int | None = None,
+) -> str | None:
+    payload: dict[str, object] = {
+        "model": model or settings.model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+
+    request = urllib.request.Request(
+        settings.endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=settings.timeout_seconds) as response:
+            raw_body = response.read().decode("utf-8")
+        decoded = json.loads(raw_body)
+        return decoded["choices"][0]["message"]["content"]
+    except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError, ValueError):
+        return None
+
+
+def extract_json_object(raw_text: str) -> dict[str, object] | None:
+    cleaned = raw_text.strip()
+    if not cleaned:
+        return None
+
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    if not match:
+        return None
+
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def generate_row_commentary(results_df: pd.DataFrame, settings: AISettings) -> pd.DataFrame:
@@ -80,46 +142,35 @@ def generate_template_comment(row: pd.Series) -> tuple[str, str]:
 
 
 def try_lm_studio_comment(row: pd.Series, settings: AISettings) -> tuple[str | None, str | None]:
-    prompt = {
-        "role": "user",
-        "content": (
-            "Ты помощник аудитора. Верни JSON с полями comment и action. "
-            "Дай краткое пояснение на русском языке без лишней воды.\n"
-            f"Статус: {row['status']}\n"
-            f"Риск-балл: {row['risk_score']}\n"
-            f"Документ: {row.get('document_number')}\n"
-            f"Контрагент: {row.get('counterparty')}\n"
-            f"Сумма: {row.get('amount')}\n"
-            f"Причины: {row.get('reason_details')}\n"
-            f"Сопоставление с документом: {row.get('document_check_status')}\n"
-        ),
-    }
-    payload = {
-        "model": settings.model,
-        "messages": [
+    content = request_lm_studio_completion(
+        [
             {
                 "role": "system",
                 "content": "Ты внутренний аудитор. Отвечай строго JSON-объектом.",
             },
-            prompt,
+            {
+                "role": "user",
+                "content": (
+                    "Ты помощник аудитора. Верни JSON с полями comment и action. "
+                    "Дай краткое пояснение на русском языке без лишней воды.\n"
+                    f"Статус: {row['status']}\n"
+                    f"Риск-балл: {row['risk_score']}\n"
+                    f"Документ: {row.get('document_number')}\n"
+                    f"Контрагент: {row.get('counterparty')}\n"
+                    f"Сумма: {row.get('amount')}\n"
+                    f"Причины: {row.get('reason_details')}\n"
+                    f"Сопоставление с документом: {row.get('document_check_status')}\n"
+                ),
+            },
         ],
-        "temperature": 0.2,
-    }
-    request = urllib.request.Request(
-        settings.endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        settings,
+        temperature=0.2,
+        max_tokens=500,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=settings.timeout_seconds) as response:
-            raw_body = response.read().decode("utf-8")
-        decoded = json.loads(raw_body)
-        content = decoded["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
-        return parsed.get("comment"), parsed.get("action")
-    except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError, ValueError):
+    parsed = extract_json_object(content or "")
+    if not parsed:
         return None, None
+    return parsed.get("comment"), parsed.get("action")
 
 
 def generate_dataset_conclusion(summary: dict[str, object], settings: AISettings) -> str:
@@ -132,9 +183,8 @@ def generate_dataset_conclusion(summary: dict[str, object], settings: AISettings
     if not settings.use_lm_studio:
         return template
 
-    payload = {
-        "model": settings.model,
-        "messages": [
+    content = request_lm_studio_completion(
+        [
             {
                 "role": "system",
                 "content": "Ты аудитор. Дай краткое итоговое заключение на русском языке в 2-3 предложениях.",
@@ -144,21 +194,13 @@ def generate_dataset_conclusion(summary: dict[str, object], settings: AISettings
                 "content": json.dumps(summary, ensure_ascii=False),
             },
         ],
-        "temperature": 0.2,
-    }
-    request = urllib.request.Request(
-        settings.endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        settings,
+        temperature=0.2,
+        max_tokens=400,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=settings.timeout_seconds) as response:
-            raw_body = response.read().decode("utf-8")
-        decoded = json.loads(raw_body)
-        return decoded["choices"][0]["message"]["content"].strip()
-    except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError, ValueError):
+    if not content:
         return template
+    return content.strip()
 
 
 def _models_url_from_chat_endpoint(endpoint: str) -> str:

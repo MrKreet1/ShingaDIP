@@ -24,6 +24,10 @@ from shingadip.reporting import (
 )
 
 
+TEXT_MODEL_ID = "qwen2.5-7b-instruct"
+VISION_MODEL_ID = "qwen2.5-vl-7b-instruct"
+
+
 st.set_page_config(
     page_title="AI-аудит бухгалтерских операций",
     page_icon=None,
@@ -333,45 +337,55 @@ def render_sidebar() -> dict[str, object]:
     st.sidebar.header("Настройки анализа")
     use_demo_data = st.sidebar.checkbox("Использовать демонстрационный набор", value=True)
     include_demo_docs = st.sidebar.checkbox("Подключить демонстрационные документы", value=True)
-    use_lm_studio = st.sidebar.checkbox("Использовать локальную LLM через LM Studio", value=False)
+    use_text_llm = st.sidebar.checkbox("Использовать модель для текста", value=False)
+    use_document_llm = st.sidebar.checkbox("Использовать модель для документов", value=False)
+    use_any_lm = use_text_llm or use_document_llm
     endpoint = st.sidebar.text_input(
         "Endpoint",
         value="http://127.0.0.1:8080/v1/chat/completions",
-        disabled=not use_lm_studio,
+        disabled=not use_any_lm,
     )
-    default_model = "qwen2.5-7b-instruct"
     discovered_models: list[str] = []
     discovery_error: str | None = None
-    if use_lm_studio:
+    if use_any_lm:
         discovered_models, discovery_error = discover_lm_studio_models(endpoint)
 
-    if use_lm_studio and discovered_models:
-        default_index = discovered_models.index(default_model) if default_model in discovered_models else 0
-        model = st.sidebar.selectbox(
-            "Модель",
-            options=discovered_models,
-            index=default_index,
+    if use_any_lm and discovery_error:
+        st.sidebar.warning(
+            "Не удалось получить список моделей из LM Studio. "
+            "Проверьте endpoint и что локальный сервер запущен."
         )
-        st.sidebar.caption(
-            f"LM Studio доступен. Найдено моделей: {len(discovered_models)}."
-        )
-    else:
-        model = st.sidebar.text_input(
-            "Модель",
-            value=default_model,
-            disabled=not use_lm_studio,
-        )
-        if use_lm_studio and discovery_error:
+    elif use_any_lm:
+        st.sidebar.caption(f"LM Studio доступен. Найдено моделей: {len(discovered_models)}.")
+
+    if use_text_llm:
+        st.sidebar.caption(f"Текстовая модель зафиксирована: `{TEXT_MODEL_ID}`")
+        if discovered_models and TEXT_MODEL_ID not in discovered_models:
             st.sidebar.warning(
-                "Не удалось получить список моделей из LM Studio. "
-                "Проверьте endpoint и что локальный сервер запущен."
+                f"Модель `{TEXT_MODEL_ID}` не найдена среди загруженных в LM Studio."
             )
+
+    use_vision_for_documents = use_document_llm
+    if use_document_llm:
+        st.sidebar.caption(f"Модель для документов зафиксирована: `{VISION_MODEL_ID}`")
+        if discovered_models and VISION_MODEL_ID not in discovered_models:
+            st.sidebar.warning(
+                f"Модель `{VISION_MODEL_ID}` не найдена среди загруженных в LM Studio."
+            )
+
+    max_document_ai_calls = st.sidebar.slider(
+        "Максимум AI-разборов документов",
+        min_value=1,
+        max_value=20,
+        value=10,
+        disabled=not use_document_llm,
+    )
     max_llm_rows = st.sidebar.slider(
         "Максимум LLM-пояснений за запуск",
         min_value=1,
         max_value=20,
         value=8,
-        disabled=not use_lm_studio,
+        disabled=not use_text_llm,
     )
     st.sidebar.caption(
         "При недоступности OCR или локальной модели система продолжит работу с офлайн-фолбэками."
@@ -380,10 +394,13 @@ def render_sidebar() -> dict[str, object]:
         "use_demo_data": use_demo_data,
         "include_demo_docs": include_demo_docs,
         "ai_settings": AISettings(
-            use_lm_studio=use_lm_studio,
+            use_lm_studio=use_text_llm,
             endpoint=endpoint,
-            model=model,
+            model=TEXT_MODEL_ID,
             max_rows=max_llm_rows,
+            use_vision_for_documents=use_vision_for_documents,
+            vision_model=VISION_MODEL_ID,
+            max_document_ai_calls=max_document_ai_calls,
         ),
     }
 
@@ -417,7 +434,7 @@ def run_analysis(
     ensure_workspace()
     run_dir = prepare_run_directory()
     operations_df = read_operations_file(operations_source)
-    extracted_documents = extract_documents(document_sources, run_dir / "documents")
+    extracted_documents = extract_documents(document_sources, run_dir / "documents", ai_settings)
     results_df = analyze_operations(operations_df, extracted_documents)
     results_df = generate_row_commentary(results_df, ai_settings)
     summary = build_summary(results_df, extracted_documents)
@@ -564,12 +581,14 @@ def main() -> None:
         operations_source: object | None = operations_file
         document_sources: list[object] = list(uploaded_docs)
         source_label = "Пользовательский файл"
+        use_demo_operations = False
 
         if operations_source is None and settings["use_demo_data"]:
             operations_source = demo_operation_path()
             source_label = "Демонстрационный CSV"
+            use_demo_operations = True
 
-        if not document_sources and settings["use_demo_data"] and settings["include_demo_docs"]:
+        if not document_sources and use_demo_operations and settings["include_demo_docs"]:
             document_sources = demo_document_paths()
 
         if operations_source is None:
