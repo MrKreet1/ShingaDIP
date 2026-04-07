@@ -14,11 +14,78 @@ from shingadip.config import (
     DEFAULT_DOCUMENT_ENDPOINT,
     DEFAULT_LIGHTONOCR_ENDPOINT,
     DEFAULT_TEXT_ENDPOINT,
-    LIGHTONOCR_MODEL_ID,
     LIGHTONOCR_MODEL_CANDIDATES,
+    LIGHTONOCR_MODEL_ID,
+    RISK_WEIGHTS,
     TEXT_MODEL_ID,
     VISION_MODEL_ID,
 )
+
+
+RISK_FACTOR_LABELS = {
+    "missing_required_fields": "отсутствие обязательных реквизитов",
+    "duplicate_document_number": "дублирование номера документа",
+    "amount_outlier": "нетипично высокая сумма",
+    "suspicious_description": "подозрительное описание операции",
+    "atypical_counterparty": "редкий или нетипичный контрагент",
+    "no_primary_document": "отсутствие подтверждающего документа",
+    "document_amount_mismatch": "расхождение суммы с документом",
+    "document_date_mismatch": "расхождение даты с документом",
+    "document_counterparty_mismatch": "расхождение контрагента с документом",
+    "document_incomplete": "неполные реквизиты документа",
+    "ml_anomaly": "нетипичность по модели аномалий",
+}
+
+RISK_CATEGORY_LABELS = {
+    "document": "Документарный риск",
+    "amount": "Риск суммы",
+    "counterparty": "Риск контрагента",
+    "description": "Риск описания",
+    "duplicate": "Риск дублирования",
+    "anomaly": "Аномальный риск",
+    "data_quality": "Риск качества реквизитов",
+}
+
+RISK_CATEGORY_MAP = {
+    "missing_required_fields": "data_quality",
+    "duplicate_document_number": "duplicate",
+    "amount_outlier": "amount",
+    "suspicious_description": "description",
+    "atypical_counterparty": "counterparty",
+    "no_primary_document": "document",
+    "document_amount_mismatch": "document",
+    "document_date_mismatch": "document",
+    "document_counterparty_mismatch": "document",
+    "document_incomplete": "document",
+    "ml_anomaly": "anomaly",
+}
+
+ACTION_SEEDS = {
+    "document_amount_mismatch": "Сверить сумму в учете, первичном документе и платежных регистрах.",
+    "no_primary_document": "Запросить первичный документ и проверить документальное обоснование операции.",
+    "document_counterparty_mismatch": "Проверить правильность указания контрагента в учете и документе.",
+    "document_date_mismatch": "Проверить дату признания операции и дату первичного документа.",
+    "duplicate_document_number": "Проверить, не произошло ли двойного отражения одной и той же операции.",
+    "missing_required_fields": "Уточнить отсутствующие реквизиты и подтвердить хозяйственное содержание операции.",
+    "amount_outlier": "Проверить экономическое основание нетипично крупной суммы.",
+    "suspicious_description": "Уточнить содержание операции и проверить корректность описания.",
+    "atypical_counterparty": "Проверить историю взаимодействия с контрагентом и основания выбора поставщика.",
+    "ml_anomaly": "Провести выборочную ручную проверку, так как операция нетипична для выборки.",
+}
+
+PRIORITY_ORDER = [
+    "document_amount_mismatch",
+    "no_primary_document",
+    "document_counterparty_mismatch",
+    "document_date_mismatch",
+    "missing_required_fields",
+    "duplicate_document_number",
+    "amount_outlier",
+    "suspicious_description",
+    "atypical_counterparty",
+    "ml_anomaly",
+    "document_incomplete",
+]
 
 
 @dataclass(slots=True)
@@ -191,93 +258,201 @@ def extract_json_object(raw_text: str) -> dict[str, object] | None:
 
 
 def generate_row_commentary(results_df: pd.DataFrame, settings: AISettings) -> pd.DataFrame:
-    enriched = results_df.copy()
-    comments: list[str] = []
+    enriched = apply_machine_audit_layer(results_df)
+    short_comments: list[str] = []
+    full_comments: list[str] = []
     actions: list[str] = []
     llm_budget = settings.max_rows
 
     for _, row in enriched.iterrows():
-        comment, action = generate_template_comment(row)
+        short_comment, full_comment, action = generate_template_commentary(row)
         if settings.use_lm_studio and row["status"] != "OK" and llm_budget > 0:
-            llm_comment, llm_action = try_lm_studio_comment(row, settings)
-            if llm_comment:
-                comment = llm_comment
+            llm_short, llm_full, llm_action = try_lm_studio_comment(row, settings)
+            if llm_short and llm_full:
+                short_comment = llm_short
+                full_comment = llm_full
                 action = llm_action or action
                 llm_budget -= 1
-        comments.append(comment)
+        short_comments.append(short_comment)
+        full_comments.append(full_comment)
         actions.append(action)
 
-    enriched["ai_comment"] = comments
+    enriched["short_ai_comment"] = short_comments
+    enriched["full_ai_comment"] = full_comments
+    enriched["ai_comment"] = short_comments
     enriched["recommended_action"] = actions
     return enriched
 
 
-def generate_template_comment(row: pd.Series) -> tuple[str, str]:
-    status = row["status"]
-    if status == "OK":
-        return (
-            "Операция выглядит согласованной с учетом доступных данных. Существенных признаков повышенного риска не обнаружено.",
-            "Сохранить результат проверки и оставить операцию в выборке без дополнительной эскалации.",
+def apply_machine_audit_layer(results_df: pd.DataFrame) -> pd.DataFrame:
+    enriched = results_df.copy()
+    priorities: list[str] = []
+    confidences: list[str] = []
+    categories: list[str] = []
+    top_factors: list[str] = []
+    dominant_factors: list[str] = []
+    primary_drivers: list[str] = []
+    action_seeds: list[str] = []
+    payloads: list[str] = []
+    flags_payloads: list[str] = []
+
+    for _, row in enriched.iterrows():
+        payload = build_row_interpretation_payload(row)
+        priorities.append(payload["priority"])
+        confidences.append(payload["confidence"])
+        categories.append(payload["risk_category"])
+        top_factors.append("; ".join(payload["top_risk_factors"]))
+        dominant_factors.append("; ".join(payload["dominant_risk_factors"]))
+        primary_drivers.append(payload["primary_risk_driver"])
+        action_seeds.append(payload["recommended_action_seed"])
+        payloads.append(json.dumps(payload, ensure_ascii=False))
+        flags_payloads.append(json.dumps(payload["flags"], ensure_ascii=False))
+
+    enriched["priority"] = priorities
+    enriched["confidence"] = confidences
+    enriched["risk_category"] = categories
+    enriched["top_risk_factors"] = top_factors
+    enriched["dominant_risk_factors"] = dominant_factors
+    enriched["primary_risk_driver"] = primary_drivers
+    enriched["recommended_action_seed"] = action_seeds
+    enriched["machine_flags_json"] = flags_payloads
+    enriched["machine_payload_json"] = payloads
+    return enriched
+
+
+def build_row_interpretation_payload(row: pd.Series) -> dict[str, object]:
+    reason_codes = _extract_reason_codes(row)
+    ranked_codes = _rank_reason_codes(reason_codes)
+    top_codes = ranked_codes[:3]
+    dominant_codes = ranked_codes[:2]
+    missing_fields = _extract_missing_fields(row)
+    flags = {
+        "missing_description": "description" in missing_fields or not str(row.get("description") or "").strip(),
+        "missing_required_fields": bool(missing_fields),
+        "high_amount": "amount_outlier" in reason_codes,
+        "rare_counterparty": "atypical_counterparty" in reason_codes,
+        "document_missing": "no_primary_document" in reason_codes or str(row.get("document_check_status")) == "MISSING",
+        "document_mismatch": str(row.get("document_check_status")) == "MISMATCH",
+        "document_not_provided": str(row.get("document_check_status")) == "NOT_PROVIDED",
+        "anomaly_model_flag": "ml_anomaly" in reason_codes,
+        "duplicate_document": "duplicate_document_number" in reason_codes,
+        "amount_mismatch": "document_amount_mismatch" in reason_codes,
+        "date_mismatch": "document_date_mismatch" in reason_codes,
+        "counterparty_mismatch": "document_counterparty_mismatch" in reason_codes,
+        "suspicious_description": "suspicious_description" in reason_codes,
+        "document_incomplete": "document_incomplete" in reason_codes,
+    }
+
+    payload = {
+        "operation_id": row.get("operation_id"),
+        "status": row.get("status"),
+        "risk_score": int(row.get("risk_score", 0) or 0),
+        "priority": _build_priority(row, reason_codes, flags),
+        "confidence": _build_confidence(row, reason_codes, flags),
+        "risk_category": _build_risk_category(reason_codes, flags),
+        "amount": _safe_numeric_value(row.get("amount")),
+        "amount_display": row.get("amount_display"),
+        "counterparty": row.get("counterparty"),
+        "document_number": row.get("document_number"),
+        "document_check_status": row.get("document_check_status"),
+        "top_risk_factors": [_reason_label(code) for code in top_codes],
+        "dominant_risk_factors": [_reason_label(code) for code in dominant_codes],
+        "primary_risk_driver": _reason_label(top_codes[0]) if top_codes else "существенные отклонения не выявлены",
+        "flags": flags,
+        "recommended_action_seed": _build_recommended_action_seed(reason_codes, row),
+    }
+    return payload
+
+
+def generate_template_commentary(row: pd.Series) -> tuple[str, str, str]:
+    payload = _payload_from_row(row)
+    recommended_action = payload["recommended_action_seed"]
+
+    if payload["status"] == "OK":
+        short_comment = (
+            "Операция не содержит существенных признаков риска и не требует дополнительной эскалации."
         )
+        full_comment = (
+            f"Операция оценена как низкорисковая. Приоритет проверки — {payload['priority']}, "
+            f"уверенность оценки — {payload['confidence']}. "
+            f"{_build_document_status_sentence(payload)}"
+        )
+        return short_comment, full_comment, recommended_action
 
-    reasons = row["reason_details"]
-    if "Сумма операции не совпадает" in reasons:
-        action = "Сверить сумму по первичному документу, регистру учета и проводке, затем проверить корректность ручного ввода."
-    elif "Номер документа встречается" in reasons:
-        action = "Проверить, не было ли повторного отражения одной и той же операции или дублирования загрузки."
-    elif "Не найден подходящий первичный документ" in reasons:
-        action = "Запросить подтверждающий документ и проверить комплектность первичной документации."
-    elif "Дата операции не совпадает" in reasons:
-        action = "Проверить дату признания операции и дату документа, а также основание для расхождения."
-    else:
-        action = "Провести выборочную ручную проверку реквизитов, основания операции и маршрута согласования."
+    risk_level_text = {
+        "HIGH": "высокий приоритет проверки",
+        "MEDIUM": "средний приоритет проверки",
+        "LOW": "низкий приоритет проверки",
+    }.get(payload["priority"], "средний приоритет проверки")
 
-    comment = (
-        f"Операция получила статус {status} с риск-баллом {row['risk_score']}. "
-        f"Основные причины: {reasons}"
+    dominant = payload["dominant_risk_factors"] or payload["top_risk_factors"]
+    dominant_text = ", ".join(dominant[:2]) if dominant else "существенные факторы риска"
+    additional_factors = payload["top_risk_factors"][2:]
+    additional_text = ""
+    if additional_factors:
+        additional_text = f" Дополнительно влияние оказали {', '.join(additional_factors)}."
+
+    short_comment = (
+        f"Операция имеет {risk_level_text} из-за сочетания факторов: {dominant_text}."
     )
-    return comment, action
+    full_comment = (
+        f"Операция классифицирована как {payload['status']} с риск-баллом {payload['risk_score']}. "
+        f"Приоритет проверки — {payload['priority']}, уверенность оценки — {payload['confidence']}. "
+        f"Основной вклад в риск внесли {dominant_text}. "
+        f"{_build_importance_sentence(payload)}"
+        f"{additional_text} "
+        f"Категория риска: {payload['risk_category']}."
+    ).strip()
+    return short_comment, full_comment, recommended_action
 
 
-def try_lm_studio_comment(row: pd.Series, settings: AISettings) -> tuple[str | None, str | None]:
+def try_lm_studio_comment(row: pd.Series, settings: AISettings) -> tuple[str | None, str | None, str | None]:
+    payload = _payload_from_row(row)
     content = request_lm_studio_completion(
         [
             {
                 "role": "system",
-                "content": "Ты внутренний аудитор. Отвечай строго JSON-объектом.",
+                "content": (
+                    "Ты помощник по бухгалтерскому учету и аудиту. "
+                    "Формируй деловой, краткий и профессиональный комментарий по операции. "
+                    "Не повторяй причины дословно. Не перечисляй флаги механически. "
+                    "Сначала дай вывод о риске, затем объясни, какие факторы на него повлияли, "
+                    "затем укажи рекомендуемое действие. Не придумывай факты, которых нет во входных данных. "
+                    "Пиши так, как будто это часть внутреннего аудиторского заключения. "
+                    "Верни строго JSON с полями short_comment, full_comment, recommended_action."
+                ),
             },
             {
                 "role": "user",
                 "content": (
-                    "Ты помощник аудитора. Верни JSON с полями comment и action. "
-                    "Дай краткое пояснение на русском языке без лишней воды.\n"
-                    f"Статус: {row['status']}\n"
-                    f"Риск-балл: {row['risk_score']}\n"
-                    f"Документ: {row.get('document_number')}\n"
-                    f"Контрагент: {row.get('counterparty')}\n"
-                    f"Сумма: {row.get('amount')}\n"
-                    f"Причины: {row.get('reason_details')}\n"
-                    f"Сопоставление с документом: {row.get('document_check_status')}\n"
+                    "Проанализируй операцию на основе уже рассчитанных факторов риска. "
+                    "LLM не должна менять статус, риск-балл или машинные выводы, а только интерпретировать их.\n"
+                    f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
                 ),
             },
         ],
         settings,
-        temperature=0.2,
-        max_tokens=500,
+        temperature=0.15,
+        max_tokens=700,
     )
     parsed = extract_json_object(content or "")
     if not parsed:
-        return None, None
-    return parsed.get("comment"), parsed.get("action")
+        return None, None, None
+    short_comment = _clean_output_text(parsed.get("short_comment"))
+    full_comment = _clean_output_text(parsed.get("full_comment"))
+    recommended_action = _clean_output_text(parsed.get("recommended_action"))
+    if not short_comment or not full_comment:
+        return None, None, None
+    return short_comment, full_comment, recommended_action
 
 
-def generate_dataset_conclusion(summary: dict[str, object], settings: AISettings) -> str:
-    template = (
-        f"Проанализировано {summary['total_operations']} операций. "
-        f"Высокий риск присвоен {summary['risk_count']} операциям, предупреждения получены по {summary['warning_count']} операциям. "
-        f"Наиболее частые причины отклонений: {summary['top_reason_text']}. "
-        "Рекомендуется вручную проверить операции со статусами WARNING и RISK и подтвердить их первичными документами."
-    )
+def generate_dataset_conclusion(
+    summary: dict[str, object],
+    report_tables: dict[str, pd.DataFrame],
+    settings: AISettings,
+) -> str:
+    dataset_payload = build_dataset_interpretation_payload(summary, report_tables)
+    template = build_dataset_commentary_template(dataset_payload)
     if not settings.use_lm_studio:
         return template
 
@@ -285,20 +460,276 @@ def generate_dataset_conclusion(summary: dict[str, object], settings: AISettings
         [
             {
                 "role": "system",
-                "content": "Ты аудитор. Дай краткое итоговое заключение на русском языке в 2-3 предложениях.",
+                "content": (
+                    "Ты помощник внутреннего аудитора. "
+                    "Сформируй итоговое заключение по набору операций деловым языком. "
+                    "Не пересчитывай риски и не придумывай факты. "
+                    "Структура ответа: 1. Итоговое заключение 2. Ключевые проблемы "
+                    "3. Самые рискованные операции 4. Проблемные контрагенты "
+                    "5. Документальное покрытие 6. Рекомендация."
+                ),
             },
             {
                 "role": "user",
-                "content": json.dumps(summary, ensure_ascii=False),
+                "content": json.dumps(dataset_payload, ensure_ascii=False, indent=2),
             },
         ],
         settings,
-        temperature=0.2,
-        max_tokens=400,
+        temperature=0.15,
+        max_tokens=900,
     )
     if not content:
         return template
     return content.strip()
+
+
+def build_dataset_interpretation_payload(
+    summary: dict[str, object],
+    report_tables: dict[str, pd.DataFrame],
+) -> dict[str, object]:
+    risk_register = report_tables.get("risk_register", pd.DataFrame())
+    reason_summary = report_tables.get("reason_summary", pd.DataFrame())
+    counterparty_summary = report_tables.get("counterparty_summary", pd.DataFrame())
+
+    top_risk_operations = []
+    if not risk_register.empty:
+        for _, row in risk_register.head(5).iterrows():
+            top_risk_operations.append(
+                {
+                    "operation_id": row.get("ID операции"),
+                    "document_number": row.get("Номер документа"),
+                    "counterparty": row.get("Контрагент"),
+                    "amount": row.get("Сумма"),
+                    "status": row.get("Статус"),
+                    "risk_score": row.get("Риск-балл"),
+                    "priority": row.get("Приоритет проверки"),
+                    "risk_category": row.get("Категория риска"),
+                    "main_driver": row.get("Ведущий фактор риска"),
+                    "recommended_action": row.get("Рекомендуемое действие"),
+                }
+            )
+
+    top_reasons = []
+    if not reason_summary.empty:
+        top_reasons = reason_summary.head(5).to_dict(orient="records")
+
+    counterparties = []
+    if not counterparty_summary.empty:
+        counterparties = counterparty_summary.head(5).to_dict(orient="records")
+
+    return {
+        "total_operations": summary["total_operations"],
+        "ok_count": summary["ok_count"],
+        "warning_count": summary["warning_count"],
+        "risk_count": summary["risk_count"],
+        "average_risk_score": summary["average_risk_score"],
+        "document_coverage": summary["document_coverage"],
+        "document_coverage_percent": summary.get("document_coverage_percent", 0.0),
+        "top_reasons": top_reasons,
+        "problematic_counterparties": summary.get("problematic_counterparties_text", "не выявлены"),
+        "top_risk_operations": top_risk_operations,
+        "counterparty_focus": counterparties,
+        "recommendation_seed": summary.get("audit_recommendation"),
+    }
+
+
+def build_dataset_commentary_template(dataset_payload: dict[str, object]) -> str:
+    top_reasons = dataset_payload.get("top_reasons", [])
+    top_risk_operations = dataset_payload.get("top_risk_operations", [])
+    main_reasons_text = (
+        ", ".join(item["Причина"] for item in top_reasons[:3] if item.get("Причина"))
+        if top_reasons
+        else "существенные отклонения не выявлены"
+    )
+
+    if top_risk_operations:
+        top_risk_lines = []
+        for item in top_risk_operations[:5]:
+            top_risk_lines.append(
+                f"- {item.get('operation_id')}: {item.get('counterparty')} | {item.get('amount')} | "
+                f"{item.get('main_driver')} | {item.get('recommended_action')}"
+            )
+        top_risk_text = "\n".join(top_risk_lines)
+    else:
+        top_risk_text = "- Операции с повышенным риском не выявлены."
+
+    coverage_percent = float(dataset_payload.get("document_coverage_percent", 0.0) or 0.0)
+    if coverage_percent >= 80:
+        coverage_quality = "документальное покрытие можно оценить как высокое"
+    elif coverage_percent >= 50:
+        coverage_quality = "документальное покрытие можно оценить как умеренное"
+    else:
+        coverage_quality = "документальное покрытие остается ограниченным"
+
+    return (
+        "1. Итоговое заключение\n"
+        f"Проанализировано {dataset_payload['total_operations']} операций: "
+        f"OK — {dataset_payload['ok_count']}, WARNING — {dataset_payload['warning_count']}, "
+        f"RISK — {dataset_payload['risk_count']}. Основные риски связаны с факторами: {main_reasons_text}.\n\n"
+        "2. Ключевые проблемы\n"
+        f"Наиболее заметные отклонения сосредоточены в блоках, связанных с документальным подтверждением, "
+        f"нетипичными параметрами операций и качеством заполнения реквизитов. "
+        f"Средний риск по выборке составляет {dataset_payload['average_risk_score']}.\n\n"
+        "3. Самые рискованные операции\n"
+        f"{top_risk_text}\n\n"
+        "4. Проблемные контрагенты\n"
+        f"Наибольшее число отклонений связано с контрагентами: {dataset_payload.get('problematic_counterparties', 'не выявлены')}.\n\n"
+        "5. Документальное покрытие\n"
+        f"Покрытие документами составляет {dataset_payload['document_coverage']} "
+        f"({dataset_payload.get('document_coverage_percent', 0.0)}%), поэтому {coverage_quality}.\n\n"
+        "6. Рекомендация\n"
+        f"{dataset_payload.get('recommendation_seed', 'Продолжить выборочную проверку операций с повышенным риском.')}"
+    )
+
+
+def _payload_from_row(row: pd.Series) -> dict[str, object]:
+    payload_json = row.get("machine_payload_json")
+    if isinstance(payload_json, str) and payload_json.strip():
+        try:
+            parsed = json.loads(payload_json)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    return build_row_interpretation_payload(row)
+
+
+def _extract_reason_codes(row: pd.Series) -> list[str]:
+    raw_codes = str(row.get("reason_codes", "") or "")
+    return [item.strip() for item in raw_codes.split("|") if item.strip()]
+
+
+def _extract_missing_fields(row: pd.Series) -> list[str]:
+    value = row.get("missing_required_fields", [])
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+    return [item.strip() for item in text.strip("[]").replace("'", "").split(",") if item.strip()]
+
+
+def _rank_reason_codes(reason_codes: list[str]) -> list[str]:
+    def key(code: str) -> tuple[int, int]:
+        return (-int(RISK_WEIGHTS.get(code, 0)), PRIORITY_ORDER.index(code) if code in PRIORITY_ORDER else 999)
+
+    return sorted(reason_codes, key=key)
+
+
+def _reason_label(code: str) -> str:
+    return RISK_FACTOR_LABELS.get(code, code)
+
+
+def _build_priority(row: pd.Series, reason_codes: list[str], flags: dict[str, bool]) -> str:
+    risk_score = int(row.get("risk_score", 0) or 0)
+    if (
+        risk_score >= 70
+        or "document_amount_mismatch" in reason_codes
+        or (flags["document_missing"] and flags["high_amount"])
+        or len(reason_codes) >= 4
+    ):
+        return "HIGH"
+    if risk_score >= 30 or reason_codes:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _build_confidence(row: pd.Series, reason_codes: list[str], flags: dict[str, bool]) -> str:
+    status = str(row.get("status", "") or "")
+    if status == "OK":
+        if str(row.get("document_check_status")) in {"OK", "PARTIAL"}:
+            return "HIGH"
+        if str(row.get("document_check_status")) == "NOT_PROVIDED":
+            return "MEDIUM"
+        return "MEDIUM"
+    if len(reason_codes) >= 3 or ("ml_anomaly" in reason_codes and len(reason_codes) >= 2):
+        return "HIGH"
+    if len(reason_codes) >= 1:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _build_risk_category(reason_codes: list[str], flags: dict[str, bool]) -> str:
+    categories: list[str] = []
+    for code in reason_codes:
+        category_code = RISK_CATEGORY_MAP.get(code)
+        if not category_code:
+            continue
+        label = RISK_CATEGORY_LABELS[category_code]
+        if label not in categories:
+            categories.append(label)
+
+    if flags["missing_description"] and RISK_CATEGORY_LABELS["description"] not in categories:
+        categories.append(RISK_CATEGORY_LABELS["description"])
+
+    if not categories:
+        return "Низкий риск"
+    if len(categories) == 1:
+        return categories[0]
+    if len(categories) == 2:
+        return f"{categories[0]} и {categories[1]}"
+    return "Комбинированный риск"
+
+
+def _build_recommended_action_seed(reason_codes: list[str], row: pd.Series) -> str:
+    for code in PRIORITY_ORDER:
+        if code in reason_codes:
+            return ACTION_SEEDS.get(code, "Провести дополнительную ручную проверку операции.")
+    if str(row.get("status")) == "OK":
+        return "Сохранить результат контроля и оставить операцию без дополнительной эскалации."
+    return "Провести дополнительную ручную проверку операции."
+
+
+def _build_document_status_sentence(payload: dict[str, object]) -> str:
+    document_status = str(payload.get("document_check_status") or "")
+    if document_status == "MISSING":
+        return "Подтверждающий документ для автоматической сверки не найден."
+    if document_status == "MISMATCH":
+        return "При автоматической сверке выявлены расхождения с документом."
+    if document_status == "NOT_PROVIDED":
+        return "Документы для автоматической сверки не были загружены, поэтому оценка основана на учетных данных."
+    if document_status == "PARTIAL":
+        return "Документ найден, но извлеченные реквизиты неполные."
+    return "Документальная сверка не выявила существенных отклонений."
+
+
+def _build_importance_sentence(payload: dict[str, object]) -> str:
+    document_status_sentence = _build_document_status_sentence(payload)
+    category = str(payload.get("risk_category") or "").lower()
+    if "документарный" in category:
+        impact = "Это повышает вероятность ошибки оформления либо недостаточного документального обоснования."
+    elif "суммы" in category:
+        impact = "Это требует подтверждения экономической обоснованности и корректности отраженной суммы."
+    elif "контрагента" in category:
+        impact = "Это требует дополнительной проверки правомерности выбора контрагента и корректности реквизитов."
+    elif "описания" in category:
+        impact = "Это снижает прозрачность хозяйственного содержания операции и усложняет внутренний контроль."
+    else:
+        impact = "Сочетание факторов повышает вероятность ошибки учета и требует дополнительной проверки."
+    return f"{document_status_sentence} {impact}"
+
+
+def _clean_output_text(value: object | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _safe_numeric_value(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except TypeError:
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _models_url_from_chat_endpoint(endpoint: str) -> str:

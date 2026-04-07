@@ -29,10 +29,12 @@ from shingadip.config import (
 from shingadip.data_processing import prepare_run_directory, read_operations_file
 from shingadip.documents import extract_documents
 from shingadip.reporting import (
+    build_audit_conclusion,
+    build_report_tables,
     build_summary,
+    export_frame_csv,
     export_results_csv,
     save_report_bundle,
-    summarize_reasons,
     to_display_frame,
 )
 
@@ -353,6 +355,29 @@ def display_value(value: object, fallback: str = "не найдено") -> str:
     return text or fallback
 
 
+def render_exportable_report(
+    title: str,
+    frame: pd.DataFrame,
+    *,
+    empty_message: str,
+    download_label: str,
+    file_name: str,
+    key: str,
+) -> None:
+    st.subheader(title)
+    if frame.empty:
+        st.info(empty_message)
+        return
+    st.dataframe(frame, use_container_width=True, hide_index=True)
+    st.download_button(
+        download_label,
+        data=export_frame_csv(frame),
+        file_name=file_name,
+        mime="text/csv",
+        key=key,
+    )
+
+
 def render_sidebar() -> dict[str, object]:
     st.sidebar.header("Настройки анализа")
     use_demo_data = st.sidebar.checkbox("Использовать демонстрационный набор", value=True)
@@ -491,8 +516,16 @@ def run_analysis(
     results_df = analyze_operations(operations_df, extracted_documents)
     results_df = generate_row_commentary(results_df, ai_settings)
     summary = build_summary(results_df, extracted_documents)
-    summary["dataset_comment"] = generate_dataset_conclusion(summary, ai_settings)
-    report_paths = save_report_bundle(results_df, summary, run_dir / "reports")
+    report_tables = build_report_tables(results_df, summary)
+    summary["dataset_comment"] = generate_dataset_conclusion(summary, report_tables, ai_settings)
+    audit_conclusion = build_audit_conclusion(summary, results_df, report_tables)
+    report_paths = save_report_bundle(
+        results_df,
+        summary,
+        run_dir / "reports",
+        report_tables=report_tables,
+        audit_conclusion=audit_conclusion,
+    )
 
     st.session_state["analysis_state"] = {
         "source_label": source_label,
@@ -501,6 +534,8 @@ def run_analysis(
         "documents_df": pd.DataFrame([doc.to_record() for doc in extracted_documents]),
         "results_df": results_df,
         "summary": summary,
+        "report_tables": report_tables,
+        "audit_conclusion": audit_conclusion,
         "report_paths": report_paths,
     }
 
@@ -517,15 +552,31 @@ def render_results(state: dict[str, object]) -> None:
     results_df: pd.DataFrame = state["results_df"]
     summary: dict[str, object] = state["summary"]
     documents_df: pd.DataFrame = state["documents_df"]
+    report_tables: dict[str, pd.DataFrame] = state["report_tables"]
+    audit_conclusion: dict[str, object] = state["audit_conclusion"]
+    risk_register = report_tables["risk_register"]
+    reason_summary = report_tables["reason_summary"]
+    counterparty_summary = report_tables["counterparty_summary"]
+    document_reconciliation = report_tables["document_reconciliation"]
 
     render_metrics(summary)
     st.caption(f"Источник данных: {state['source_label']} | Рабочая директория: {state['run_dir']}")
 
-    tabs = st.tabs(["Результаты", "Детали операции", "Документы", "Отчет"])
+    tabs = st.tabs(
+        [
+            "Результаты",
+            "Реестр рисков",
+            "Причины",
+            "Контрагенты",
+            "Сверка документов",
+            "Детали операции",
+            "Документы",
+            "Итоговое заключение",
+        ]
+    )
 
     with tabs[0]:
         st.subheader("Сводка отклонений")
-        reasons_frame = summarize_reasons(results_df)
         chart_col, reasons_col = st.columns((1, 1.1))
         with chart_col:
             status_counts = pd.DataFrame(
@@ -536,16 +587,63 @@ def render_results(state: dict[str, object]) -> None:
             ).set_index("status")
             st.bar_chart(status_counts)
         with reasons_col:
-            if reasons_frame.empty:
+            if reason_summary.empty:
                 st.info("Существенные причины отклонений не выявлены.")
             else:
-                st.dataframe(reasons_frame, use_container_width=True, hide_index=True)
+                st.dataframe(reason_summary.head(10), use_container_width=True, hide_index=True)
 
         st.subheader("Таблица результатов")
         display_df = to_display_frame(results_df)
         st.dataframe(display_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Скачать полный результат CSV",
+            data=export_results_csv(results_df),
+            file_name="audit_results.csv",
+            mime="text/csv",
+            key="download_full_results",
+        )
 
     with tabs[1]:
+        render_exportable_report(
+            "Реестр риск-операций",
+            risk_register,
+            empty_message="Операции со статусами WARNING и RISK не выявлены.",
+            download_label="Скачать risk_register.csv",
+            file_name="risk_register.csv",
+            key="download_risk_register",
+        )
+
+    with tabs[2]:
+        render_exportable_report(
+            "Отчет по причинам отклонений",
+            reason_summary,
+            empty_message="Причины отклонений отсутствуют.",
+            download_label="Скачать reason_summary.csv",
+            file_name="reason_summary.csv",
+            key="download_reason_summary",
+        )
+
+    with tabs[3]:
+        render_exportable_report(
+            "Отчет по контрагентам",
+            counterparty_summary,
+            empty_message="Нет данных для отчета по контрагентам.",
+            download_label="Скачать counterparty_summary.csv",
+            file_name="counterparty_summary.csv",
+            key="download_counterparty_summary",
+        )
+
+    with tabs[4]:
+        render_exportable_report(
+            "Отчет по сверке документов",
+            document_reconciliation,
+            empty_message="Нет данных для сверки документов.",
+            download_label="Скачать document_reconciliation.csv",
+            file_name="document_reconciliation.csv",
+            key="download_document_reconciliation",
+        )
+
+    with tabs[5]:
         st.subheader("Панель детализации")
         selectable = results_df.sort_values(["risk_score", "operation_id"], ascending=[False, True])
         labels = selectable.apply(
@@ -567,6 +665,11 @@ def render_results(state: dict[str, object]) -> None:
                     <p><strong>Сумма:</strong> {selected_row['amount_display']}</p>
                     <p><strong>Статус:</strong> <span class="{status_css_class(selected_row['status'])}">{selected_row['status']}</span></p>
                     <p><strong>Риск-балл:</strong> {selected_row['risk_score']}</p>
+                    <p><strong>Приоритет проверки:</strong> {display_value(selected_row.get('priority'))}</p>
+                    <p><strong>Уверенность:</strong> {display_value(selected_row.get('confidence'))}</p>
+                    <p><strong>Категория риска:</strong> {display_value(selected_row.get('risk_category'))}</p>
+                    <p><strong>Ведущий фактор:</strong> {display_value(selected_row.get('primary_risk_driver'))}</p>
+                    <p><strong>Ключевые факторы:</strong> {display_value(selected_row.get('top_risk_factors'))}</p>
                     <p><strong>Причины:</strong> {selected_row['reason_details']}</p>
                 </div>
                 """,
@@ -576,10 +679,12 @@ def render_results(state: dict[str, object]) -> None:
             st.markdown(
                 f"""
                 <div class="section-card">
-                    <h3>Комментарий аудитора</h3>
-                    <p>{selected_row['ai_comment']}</p>
+                    <h3>Краткий вывод</h3>
+                    <p>{display_value(selected_row.get('short_ai_comment'))}</p>
+                    <h3>Подробный аудиторский комментарий</h3>
+                    <p>{display_value(selected_row.get('full_ai_comment'))}</p>
                     <h3>Рекомендуемое действие</h3>
-                    <p>{selected_row['recommended_action']}</p>
+                    <p>{display_value(selected_row.get('recommended_action'))}</p>
                     <h3>Сопоставление с документом</h3>
                     <p><strong>Найденный документ:</strong> {selected_row['matched_document'] or 'не найден'}</p>
                     <p><strong>Статус сверки:</strong> {selected_row['document_check_status']}</p>
@@ -587,8 +692,14 @@ def render_results(state: dict[str, object]) -> None:
                 """,
                 unsafe_allow_html=True,
             )
+            if selected_row.get("machine_payload_json"):
+                st.text_area(
+                    "Машинный слой интерпретации (JSON)",
+                    display_value(selected_row.get("machine_payload_json"), fallback=""),
+                    height=220,
+                )
 
-    with tabs[2]:
+    with tabs[6]:
         st.subheader("Извлеченные документы")
         if documents_df.empty:
             st.info("Документы не были загружены.")
@@ -619,28 +730,37 @@ def render_results(state: dict[str, object]) -> None:
             with text_col:
                 st.text_area("Извлеченный текст", display_value(selected_doc["extracted_text"], fallback=""), height=320)
 
-    with tabs[3]:
+    with tabs[7]:
         st.subheader("Итоговое заключение")
         st.markdown(
             f"""
             <div class="conclusion-box">
-                <p><strong>Покрытие документами:</strong> {summary['document_coverage']}</p>
+                <p><strong>Всего операций:</strong> {audit_conclusion['total_operations']}</p>
+                <p><strong>OK / WARNING / RISK:</strong> {audit_conclusion['ok_count']} / {audit_conclusion['warning_count']} / {audit_conclusion['risk_count']}</p>
+                <p><strong>Основные причины:</strong> {audit_conclusion['main_reasons']}</p>
+                <p><strong>Проблемные контрагенты:</strong> {audit_conclusion['problematic_counterparties']}</p>
+                <p><strong>Покрытие документами:</strong> {summary['document_coverage']} ({summary['document_coverage_percent']}%)</p>
+                <p><strong>Качество документального покрытия:</strong> {audit_conclusion['document_coverage_quality']}</p>
                 <p><strong>Средний риск:</strong> {summary['average_risk_score']}</p>
-                <p><strong>Заключение:</strong> {summary['dataset_comment']}</p>
+                <p><strong>Рекомендация аудитору:</strong> {audit_conclusion['recommendation']}</p>
+                <p><strong>AI-комментарий:</strong> {summary['dataset_comment']}</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        csv_data = export_results_csv(results_df)
-        st.download_button(
-            "Скачать отчет CSV",
-            data=csv_data,
-            file_name="audit_results.csv",
-            mime="text/csv",
-        )
+        top_risk_operations = pd.DataFrame(audit_conclusion.get("top_risk_operations", []))
+        if not top_risk_operations.empty:
+            st.subheader("Топ-5 самых рискованных операций")
+            st.dataframe(top_risk_operations, use_container_width=True, hide_index=True)
+        st.text_area("Текст итогового аудиторского заключения", audit_conclusion["text"], height=220)
         st.caption(
-            "Файлы отчета также сохранены локально: "
-            f"{state['report_paths']['csv']} и {state['report_paths']['json']}"
+            "Файлы отчетов сохранены локально: "
+            f"{state['report_paths']['csv']}, "
+            f"{state['report_paths']['risk_register']}, "
+            f"{state['report_paths']['reason_summary']}, "
+            f"{state['report_paths']['counterparty_summary']}, "
+            f"{state['report_paths']['document_reconciliation']} "
+            f"и {state['report_paths']['json']}"
         )
 
 

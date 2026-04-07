@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pandas as pd
 from PIL import Image
 
-from shingadip.ai import AISettings, resolve_lightonocr_model_identifier
+from shingadip.ai import AISettings, generate_row_commentary, resolve_lightonocr_model_identifier
 from shingadip.analysis import analyze_operations
 from shingadip.data_processing import standardize_operations
 from shingadip.documents import DocumentExtraction, _normalize_llm_document_payload, extract_document
@@ -178,6 +178,40 @@ class AnalysisTests(unittest.TestCase):
         row = result.loc[result["counterparty"] == "IP Rare Vendor"].iloc[0]
         self.assertNotIn("atypical_counterparty", row["reason_codes"])
         self.assertEqual(row["status"], "OK")
+
+    def test_generate_row_commentary_adds_machine_and_ai_layers(self) -> None:
+        results_df = pd.DataFrame(
+            [
+                {
+                    "operation_id": "OP-9001",
+                    "status": "RISK",
+                    "risk_score": 84,
+                    "amount": 2750000.0,
+                    "amount_display": "2 750 000.00",
+                    "counterparty": "IP Rare Vendor 1",
+                    "document_number": "INV-9001",
+                    "document_check_status": "MISSING",
+                    "reason_codes": "missing_required_fields | amount_outlier | atypical_counterparty | no_primary_document | ml_anomaly",
+                    "reason_details": "Отсутствует описание операции, сумма выше типового диапазона, документ не найден.",
+                    "description": None,
+                    "missing_required_fields": ["description"],
+                    "matched_document": None,
+                }
+            ]
+        )
+
+        enriched = generate_row_commentary(results_df, AISettings(use_lm_studio=False))
+        row = enriched.iloc[0]
+
+        self.assertEqual(row["priority"], "HIGH")
+        self.assertEqual(row["confidence"], "HIGH")
+        self.assertTrue(str(row["risk_category"]).strip())
+        self.assertTrue(str(row["primary_risk_driver"]).strip())
+        self.assertTrue(str(row["machine_payload_json"]).strip().startswith("{"))
+        self.assertTrue(str(row["short_ai_comment"]).strip())
+        self.assertTrue(str(row["full_ai_comment"]).strip())
+        self.assertTrue(str(row["recommended_action"]).strip())
+        self.assertEqual(row["ai_comment"], row["short_ai_comment"])
 
     def test_extract_document_lightonocr_image_success(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
