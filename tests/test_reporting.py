@@ -176,6 +176,18 @@ class ReportingTests(unittest.TestCase):
         self.assertIn("WARNING", conclusion["text"])
         self.assertEqual(conclusion["document_coverage_quality"], "умеренное")
         self.assertEqual(len(conclusion["top_risk_operations"]), 2)
+        self.assertTrue(conclusion["priority_review_focus"])
+        self.assertIn("повышенным риском", conclusion["short_text"])
+
+    def test_build_summary_marks_not_provided_documents_as_not_evaluated(self) -> None:
+        not_provided_df = self.results_df.copy()
+        not_provided_df["document_check_status"] = "NOT_PROVIDED"
+        not_provided_df["matched_document"] = None
+        summary = build_summary(not_provided_df, [])
+        self.assertEqual(summary["document_coverage"], "документы не предоставлены")
+        self.assertIsNone(summary["document_coverage_percent"])
+        self.assertEqual(int(summary["documents_expected_count"]), 0)
+        self.assertEqual(int(summary["document_not_provided_count"]), len(not_provided_df))
 
     def test_save_report_bundle_writes_extended_csv_files(self) -> None:
         summary = build_summary(self.results_df, [])

@@ -355,6 +355,37 @@ def display_value(value: object, fallback: str = "не найдено") -> str:
     return text or fallback
 
 
+def _style_status_cell(value: object) -> str:
+    text = str(value or "").strip().upper()
+    if text == "RISK":
+        return "background-color: #f8d7da; color: #7a1f28; font-weight: 700; border-radius: 8px;"
+    if text == "WARNING":
+        return "background-color: #fff0cf; color: #8a5a00; font-weight: 700; border-radius: 8px;"
+    if text == "OK":
+        return "background-color: #dff3e7; color: #1f6f43; font-weight: 700; border-radius: 8px;"
+    return ""
+
+
+def _style_priority_cell(value: object) -> str:
+    text = str(value or "").strip().upper()
+    if text == "HIGH":
+        return "background-color: #f9d8d8; color: #8b1e1e; font-weight: 700; border-radius: 8px;"
+    if text == "MEDIUM":
+        return "background-color: #fff1d6; color: #8c5a00; font-weight: 700; border-radius: 8px;"
+    if text == "LOW":
+        return "background-color: #dff1ea; color: #1b6a5c; font-weight: 700; border-radius: 8px;"
+    return ""
+
+
+def style_priority_report(frame: pd.DataFrame):
+    styler = frame.style
+    if "Статус" in frame.columns:
+        styler = styler.applymap(_style_status_cell, subset=["Статус"])
+    if "Приоритет проверки" in frame.columns:
+        styler = styler.applymap(_style_priority_cell, subset=["Приоритет проверки"])
+    return styler
+
+
 def render_exportable_report(
     title: str,
     frame: pd.DataFrame,
@@ -735,24 +766,50 @@ def render_results(state: dict[str, object]) -> None:
         st.markdown(
             f"""
             <div class="conclusion-box">
+                <p><strong>Краткое заключение:</strong> {audit_conclusion['short_text']}</p>
                 <p><strong>Всего операций:</strong> {audit_conclusion['total_operations']}</p>
                 <p><strong>OK / WARNING / RISK:</strong> {audit_conclusion['ok_count']} / {audit_conclusion['warning_count']} / {audit_conclusion['risk_count']}</p>
                 <p><strong>Основные причины:</strong> {audit_conclusion['main_reasons']}</p>
                 <p><strong>Проблемные контрагенты:</strong> {audit_conclusion['problematic_counterparties']}</p>
-                <p><strong>Покрытие документами:</strong> {summary['document_coverage']} ({summary['document_coverage_percent']}%)</p>
+                <p><strong>Покрытие документами:</strong> {display_value(summary['document_coverage'])}</p>
                 <p><strong>Качество документального покрытия:</strong> {audit_conclusion['document_coverage_quality']}</p>
+                <p><strong>Комментарий по документам:</strong> {display_value(audit_conclusion.get('document_scope_note'), fallback='нет дополнительного комментария')}</p>
                 <p><strong>Средний риск:</strong> {summary['average_risk_score']}</p>
                 <p><strong>Рекомендация аудитору:</strong> {audit_conclusion['recommendation']}</p>
-                <p><strong>AI-комментарий:</strong> {summary['dataset_comment']}</p>
             </div>
             """,
             unsafe_allow_html=True,
         )
-        top_risk_operations = pd.DataFrame(audit_conclusion.get("top_risk_operations", []))
-        if not top_risk_operations.empty:
-            st.subheader("Топ-5 самых рискованных операций")
-            st.dataframe(top_risk_operations, use_container_width=True, hide_index=True)
-        st.text_area("Текст итогового аудиторского заключения", audit_conclusion["text"], height=220)
+        focus_col, top_col = st.columns((0.85, 1.15))
+        with focus_col:
+            st.subheader("Что проверять в первую очередь")
+            priority_focus = audit_conclusion.get("priority_review_focus", [])
+            if priority_focus:
+                for item in priority_focus:
+                    st.markdown(f"- **{item['label']}**: {item['count']}")
+            else:
+                st.info("Приоритетные блоки для дополнительной ручной проверки не выявлены.")
+        with top_col:
+            top_risk_operations = pd.DataFrame(audit_conclusion.get("top_risk_operations", []))
+            if not top_risk_operations.empty:
+                st.subheader("Топ-5 самых рискованных операций")
+                preferred_columns = [
+                    "ID операции",
+                    "Контрагент",
+                    "Сумма",
+                    "Статус",
+                    "Приоритет проверки",
+                    "Категория риска",
+                    "Ведущий фактор риска",
+                    "Рекомендуемое действие",
+                ]
+                available_columns = [column for column in preferred_columns if column in top_risk_operations.columns]
+                top_risk_display = top_risk_operations[available_columns]
+                st.dataframe(style_priority_report(top_risk_display), use_container_width=True, hide_index=True)
+            else:
+                st.info("Операции с повышенным риском не выявлены.")
+        with st.expander("Подробный AI-вывод аудитора", expanded=False):
+            st.markdown(summary["dataset_comment"])
         st.caption(
             "Файлы отчетов сохранены локально: "
             f"{state['report_paths']['csv']}, "

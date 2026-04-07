@@ -524,11 +524,17 @@ def build_dataset_interpretation_payload(
         "risk_count": summary["risk_count"],
         "average_risk_score": summary["average_risk_score"],
         "document_coverage": summary["document_coverage"],
-        "document_coverage_percent": summary.get("document_coverage_percent", 0.0),
+        "document_coverage_percent": summary.get("document_coverage_percent"),
+        "documents_expected_count": summary.get("documents_expected_count", 0),
+        "document_not_provided_count": summary.get("document_not_provided_count", 0),
+        "document_missing_count": summary.get("document_missing_count", 0),
+        "document_mismatch_count": summary.get("document_mismatch_count", 0),
+        "document_scope_note": summary.get("document_scope_note", ""),
         "top_reasons": top_reasons,
         "problematic_counterparties": summary.get("problematic_counterparties_text", "не выявлены"),
         "top_risk_operations": top_risk_operations,
         "counterparty_focus": counterparties,
+        "priority_review_focus": summary.get("priority_review_focus", []),
         "recommendation_seed": summary.get("audit_recommendation"),
     }
 
@@ -536,6 +542,7 @@ def build_dataset_interpretation_payload(
 def build_dataset_commentary_template(dataset_payload: dict[str, object]) -> str:
     top_reasons = dataset_payload.get("top_reasons", [])
     top_risk_operations = dataset_payload.get("top_risk_operations", [])
+    priority_review_focus = dataset_payload.get("priority_review_focus", [])
     main_reasons_text = (
         ", ".join(item["Причина"] for item in top_reasons[:3] if item.get("Причина"))
         if top_reasons
@@ -553,13 +560,39 @@ def build_dataset_commentary_template(dataset_payload: dict[str, object]) -> str
     else:
         top_risk_text = "- Операции с повышенным риском не выявлены."
 
-    coverage_percent = float(dataset_payload.get("document_coverage_percent", 0.0) or 0.0)
-    if coverage_percent >= 80:
-        coverage_quality = "документальное покрытие можно оценить как высокое"
-    elif coverage_percent >= 50:
-        coverage_quality = "документальное покрытие можно оценить как умеренное"
+    try:
+        coverage_percent = float(dataset_payload.get("document_coverage_percent"))
+    except (TypeError, ValueError):
+        coverage_percent = None
+
+    if int(dataset_payload.get("documents_expected_count", 0) or 0) <= 0:
+        coverage_text = (
+            "Первичные документы не подавались на вход, поэтому автоматическая оценка "
+            "документального покрытия и полноты сверки не выполнялась."
+        )
+    elif coverage_percent is not None and coverage_percent >= 80:
+        coverage_text = (
+            f"Покрытие документами составляет {dataset_payload['document_coverage']} "
+            f"({coverage_percent}%), поэтому его можно оценить как высокое."
+        )
+    elif coverage_percent is not None and coverage_percent >= 50:
+        coverage_text = (
+            f"Покрытие документами составляет {dataset_payload['document_coverage']} "
+            f"({coverage_percent}%), поэтому его можно оценить как умеренное."
+        )
     else:
-        coverage_quality = "документальное покрытие остается ограниченным"
+        coverage_text = (
+            f"Покрытие документами составляет {dataset_payload['document_coverage']}; "
+            "документальное покрытие остается ограниченным."
+        )
+
+    review_focus_text = ""
+    if priority_review_focus:
+        review_focus_text = "\n".join(
+            f"- {item.get('label')}: {item.get('count')}" for item in priority_review_focus[:5]
+        )
+    else:
+        review_focus_text = "- Дополнительных приоритетных блоков для ручной проверки не выявлено."
 
     return (
         "1. Итоговое заключение\n"
@@ -575,9 +608,10 @@ def build_dataset_commentary_template(dataset_payload: dict[str, object]) -> str
         "4. Проблемные контрагенты\n"
         f"Наибольшее число отклонений связано с контрагентами: {dataset_payload.get('problematic_counterparties', 'не выявлены')}.\n\n"
         "5. Документальное покрытие\n"
-        f"Покрытие документами составляет {dataset_payload['document_coverage']} "
-        f"({dataset_payload.get('document_coverage_percent', 0.0)}%), поэтому {coverage_quality}.\n\n"
-        "6. Рекомендация\n"
+        f"{coverage_text}\n\n"
+        "6. Что проверять в первую очередь\n"
+        f"{review_focus_text}\n\n"
+        "7. Рекомендация\n"
         f"{dataset_payload.get('recommendation_seed', 'Продолжить выборочную проверку операций с повышенным риском.')}"
     )
 

@@ -34,8 +34,23 @@ def build_summary(results_df: pd.DataFrame, documents: list[DocumentExtraction])
     warning_count = int((results_df["status"] == "WARNING").sum())
     risk_count = int((results_df["status"] == "RISK").sum())
     average_risk_score = round(float(results_df["risk_score"].mean() if total_operations else 0.0), 2)
+    document_statuses = results_df.get("document_check_status", pd.Series(dtype="object")).fillna("").astype(str).str.upper()
     matched_count = int(results_df["matched_document"].notna().sum())
-    document_coverage_percent = round((matched_count / total_operations * 100) if total_operations else 0.0, 2)
+    not_provided_count = int((document_statuses == "NOT_PROVIDED").sum())
+    missing_count = int((document_statuses == "MISSING").sum())
+    mismatch_count = int((document_statuses == "MISMATCH").sum())
+    documents_expected_count = max(total_operations - not_provided_count, 0)
+    if documents_expected_count > 0:
+        document_coverage = f"{matched_count}/{documents_expected_count}"
+        document_coverage_percent: float | None = round((matched_count / documents_expected_count * 100), 2)
+        document_scope_note = (
+            f"для автоматической сверки были доступны документы по {documents_expected_count} операциям; "
+            f"без найденного документа осталось {missing_count}, с расхождениями — {mismatch_count}"
+        )
+    else:
+        document_coverage = "документы не предоставлены"
+        document_coverage_percent = None
+        document_scope_note = "первичные документы не подавались на вход, поэтому документальное покрытие не оценивалось"
 
     reason_summary = build_reason_summary(results_df)
     top_reason_text = (
@@ -47,6 +62,13 @@ def build_summary(results_df: pd.DataFrame, documents: list[DocumentExtraction])
     counterparty_summary = build_counterparty_summary(results_df)
     problematic_counterparties_text = _build_problematic_counterparties_text(counterparty_summary)
     audit_recommendation = _build_audit_recommendation(ok_count, warning_count, risk_count)
+    priority_review_focus = _build_priority_review_focus(
+        results_df,
+        {
+            "documents_expected_count": documents_expected_count,
+            "document_missing_count": missing_count,
+        },
+    )
 
     return {
         "total_operations": total_operations,
@@ -56,8 +78,14 @@ def build_summary(results_df: pd.DataFrame, documents: list[DocumentExtraction])
         "average_risk_score": average_risk_score,
         "documents_uploaded": len(documents),
         "matched_operations": matched_count,
-        "document_coverage": f"{matched_count}/{total_operations}",
+        "document_coverage": document_coverage,
         "document_coverage_percent": document_coverage_percent,
+        "documents_expected_count": documents_expected_count,
+        "document_not_provided_count": not_provided_count,
+        "document_missing_count": missing_count,
+        "document_mismatch_count": mismatch_count,
+        "document_scope_note": document_scope_note,
+        "priority_review_focus": priority_review_focus,
         "top_reason_text": top_reason_text,
         "problematic_counterparties_text": problematic_counterparties_text,
         "audit_recommendation": audit_recommendation,
@@ -87,17 +115,22 @@ def build_audit_conclusion(
     top_risk_operations = []
     if not risk_register.empty:
         top_risk_operations = risk_register.head(5).to_dict(orient="records")
-    coverage_quality = _build_document_coverage_quality(summary.get("document_coverage_percent", 0.0))
+    coverage_quality = _build_document_coverage_quality(
+        summary.get("document_coverage_percent"),
+        summary.get("documents_expected_count"),
+    )
+    priority_review_focus = _build_priority_review_focus(results_df, summary)
+    short_text = _build_short_audit_conclusion(summary, main_reasons, problematic_counterparties, coverage_quality)
 
     conclusion_text = (
         f"Проанализировано {summary['total_operations']} операций: "
         f"OK — {summary['ok_count']}, WARNING — {summary['warning_count']}, RISK — {summary['risk_count']}. "
         f"Основные причины отклонений: {main_reasons}. "
         f"Проблемные контрагенты: {problematic_counterparties}. "
-        f"Документальное покрытие: {summary['document_coverage']} "
-        f"({summary.get('document_coverage_percent', 0.0)}%), качество покрытия — {coverage_quality}. "
-        f"Рекомендация аудитору: {recommendation} "
-        f"AI-комментарий: {ai_comment}"
+        f"Документальное покрытие: {summary['document_coverage']}. "
+        f"Качество покрытия — {coverage_quality}. "
+        f"Краткий вывод: {short_text} "
+        f"Рекомендация аудитору: {recommendation}"
     )
 
     return {
@@ -109,8 +142,11 @@ def build_audit_conclusion(
         "problematic_counterparties": problematic_counterparties,
         "document_coverage": summary["document_coverage"],
         "document_coverage_quality": coverage_quality,
+        "document_scope_note": summary.get("document_scope_note", ""),
         "recommendation": recommendation,
         "ai_comment": ai_comment,
+        "short_text": short_text,
+        "priority_review_focus": priority_review_focus,
         "top_risk_operations": top_risk_operations,
         "text": conclusion_text,
     }
@@ -445,11 +481,79 @@ def _build_audit_recommendation(ok_count: int, warning_count: int, risk_count: i
     return "Данных для рекомендаций недостаточно."
 
 
-def _build_document_coverage_quality(document_coverage_percent: object) -> str:
+def _build_short_audit_conclusion(
+    summary: dict[str, object],
+    main_reasons: str,
+    problematic_counterparties: str,
+    coverage_quality: str,
+) -> str:
+    if int(summary.get("risk_count", 0) or 0) > 0:
+        return (
+            f"Выявлены операции с повышенным риском; основные проблемы связаны с причинами: {main_reasons}. "
+            f"Наибольшее внимание требуется по контрагентам: {problematic_counterparties}. "
+            f"Документальное покрытие оценивается как {coverage_quality}."
+        )
+    if int(summary.get("warning_count", 0) or 0) > 0:
+        return (
+            f"Критичных операций не выявлено, однако имеются предупреждения, связанные с причинами: {main_reasons}. "
+            f"Документальное покрытие оценивается как {coverage_quality}."
+        )
+    return "Существенных отклонений по анализируемой выборке не выявлено."
+
+
+def _build_priority_review_focus(results_df: pd.DataFrame, summary: dict[str, object]) -> list[dict[str, object]]:
+    def count_reason(code: str) -> int:
+        return int(
+            results_df["reason_codes"]
+            .fillna("")
+            .astype(str)
+            .map(lambda value: code in {item.strip() for item in value.split("|") if item.strip()})
+            .sum()
+        )
+
+    missing_description_count = int(
+        results_df.get("description", pd.Series(dtype="object"))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .eq("")
+        .sum()
+    )
+
+    focus_items = [
+        {"label": "Операции без описания", "count": missing_description_count},
+        {"label": "Крупные суммы", "count": count_reason("amount_outlier")},
+        {"label": "Дубликаты номера документа", "count": count_reason("duplicate_document_number")},
+        {"label": "Редкие контрагенты", "count": count_reason("atypical_counterparty")},
+    ]
+    if int(summary.get("documents_expected_count", 0) or 0) > 0:
+        focus_items.append(
+            {
+                "label": "Операции без найденного документа",
+                "count": int(summary.get("document_missing_count", 0) or 0),
+            }
+        )
+
+    ranked = [item for item in focus_items if int(item["count"]) > 0]
+    ranked.sort(key=lambda item: (-int(item["count"]), item["label"]))
+    return ranked[:5]
+
+
+def _build_document_coverage_quality(document_coverage_percent: object, documents_expected_count: object | None = None) -> str:
+    try:
+        expected = int(documents_expected_count) if documents_expected_count is not None else None
+    except (TypeError, ValueError):
+        expected = None
+    if expected == 0:
+        return "не оценивалось"
+
     try:
         coverage = float(document_coverage_percent)
     except (TypeError, ValueError):
-        coverage = 0.0
+        coverage = -1.0
+
+    if coverage < 0:
+        return "не оценивалось"
 
     if coverage >= 80:
         return "высокое"
