@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
+from PIL import Image
 
+from shingadip.ai import AISettings, resolve_lightonocr_model_identifier
 from shingadip.analysis import analyze_operations
 from shingadip.data_processing import standardize_operations
-from shingadip.documents import DocumentExtraction, _normalize_llm_document_payload
+from shingadip.documents import DocumentExtraction, _normalize_llm_document_payload, extract_document
 
 
 class AnalysisTests(unittest.TestCase):
@@ -174,6 +178,106 @@ class AnalysisTests(unittest.TestCase):
         row = result.loc[result["counterparty"] == "IP Rare Vendor"].iloc[0]
         self.assertNotIn("atypical_counterparty", row["reason_codes"])
         self.assertEqual(row["status"], "OK")
+
+    def test_extract_document_lightonocr_image_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "INV-3301.png"
+            Image.new("RGB", (640, 420), "white").save(image_path)
+            settings = AISettings(
+                use_document_model=True,
+                document_analysis_mode="lightonocr",
+                lightonocr_endpoint="http://127.0.0.1:8080/v1/chat/completions",
+            )
+
+            with patch(
+                "shingadip.documents.request_document_model_completion",
+                return_value=(
+                    "Invoice INV-3301\n"
+                    "Date: 2026-04-05\n"
+                    "Seller: TOO LightOn Trade\n"
+                    "Amount: 125 000 KZT\n"
+                    "Description: Office supplies"
+                ),
+            ):
+                extracted = extract_document(image_path, settings)
+
+        self.assertEqual(extracted.extraction_method, "lightonocr")
+        self.assertEqual(extracted.document_number, "INV-3301")
+        self.assertEqual(extracted.counterparty, "TOO LightOn Trade")
+        self.assertEqual(extracted.amount, 125000.0)
+        self.assertEqual(extracted.currency, "KZT")
+
+    def test_extract_document_lightonocr_fallback_to_pdf_text(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pdf_path = Path(temp_dir) / "INV-4401.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4 test")
+            settings = AISettings(
+                use_document_model=True,
+                document_analysis_mode="lightonocr",
+            )
+
+            with patch(
+                "shingadip.documents._extract_text_from_pdf",
+                return_value=(
+                    "Invoice INV-4401\n"
+                    "Date: 2026-04-07\n"
+                    "Seller: TOO PDF Supplier\n"
+                    "Amount: 98 000 KZT\n"
+                    "Description: Stationery"
+                ),
+            ), patch("shingadip.documents._render_pdf_pages", return_value=[]):
+                extracted = extract_document(pdf_path, settings)
+
+        self.assertEqual(extracted.extraction_method, "pdf_text")
+        self.assertEqual(extracted.document_number, "INV-4401")
+        self.assertEqual(extracted.amount, 98000.0)
+        self.assertIn("LightOnOCR", " ".join(extracted.warnings))
+
+    def test_lightonocr_output_is_used_in_operation_matching(self) -> None:
+        operations = standardize_operations(
+            pd.DataFrame(
+                [
+                    {
+                        "Дата операции": "2026-04-05",
+                        "Номер документа": "INV-5501",
+                        "Контрагент": "TOO Match Vendor",
+                        "Сумма": "450000",
+                        "Описание операции": "Поставка комплектующих",
+                    }
+                ]
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "INV-5501.png"
+            Image.new("RGB", (720, 480), "white").save(image_path)
+            settings = AISettings(
+                use_document_model=True,
+                document_analysis_mode="lightonocr",
+            )
+
+            with patch(
+                "shingadip.documents.request_document_model_completion",
+                return_value=(
+                    "Invoice INV-5501\n"
+                    "Date: 2026-04-05\n"
+                    "Seller: TOO Match Vendor\n"
+                    "Amount: 470 000 KZT\n"
+                    "Description: Поставка комплектующих"
+                ),
+            ):
+                extracted = extract_document(image_path, settings)
+
+        result = analyze_operations(operations, [extracted])
+        row = result.iloc[0]
+        self.assertEqual(row["document_check_status"], "MISMATCH")
+        self.assertIn("Сумма операции не совпадает", row["reason_details"])
+
+    def test_resolve_lightonocr_model_identifier_supports_lm_studio_alias(self) -> None:
+        resolved = resolve_lightonocr_model_identifier(
+            ["qwen2.5-7b-instruct", "lightonocr-2-1b", "qwen2.5-vl-7b-instruct"]
+        )
+        self.assertEqual(resolved, "lightonocr-2-1b")
 
 
 if __name__ == "__main__":

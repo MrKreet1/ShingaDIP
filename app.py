@@ -10,9 +10,22 @@ from shingadip.ai import (
     discover_lm_studio_models,
     generate_dataset_conclusion,
     generate_row_commentary,
+    resolve_lightonocr_model_identifier,
 )
 from shingadip.analysis import analyze_operations
-from shingadip.config import DEMO_DATA_DIR, SUPPORTED_DOCUMENT_TYPES, ensure_workspace
+from shingadip.config import (
+    DEFAULT_DOCUMENT_ANALYSIS_MODE,
+    DEFAULT_LIGHTONOCR_ENDPOINT,
+    DEFAULT_TEXT_ENDPOINT,
+    DEMO_DATA_DIR,
+    DOCUMENT_AI_MODES,
+    DOCUMENT_ANALYSIS_MODE_OPTIONS,
+    LIGHTONOCR_MODEL_ID,
+    SUPPORTED_DOCUMENT_TYPES,
+    TEXT_MODEL_ID,
+    VISION_MODEL_ID,
+    ensure_workspace,
+)
 from shingadip.data_processing import prepare_run_directory, read_operations_file
 from shingadip.documents import extract_documents
 from shingadip.reporting import (
@@ -22,11 +35,6 @@ from shingadip.reporting import (
     summarize_reasons,
     to_display_frame,
 )
-
-
-TEXT_MODEL_ID = "qwen2.5-7b-instruct"
-VISION_MODEL_ID = "qwen2.5-vl-7b-instruct"
-
 
 st.set_page_config(
     page_title="AI-аудит бухгалтерских операций",
@@ -333,52 +341,60 @@ def status_css_class(status: str) -> str:
     return "status-risk"
 
 
+def display_value(value: object, fallback: str = "не найдено") -> str:
+    if value is None:
+        return fallback
+    try:
+        if pd.isna(value):
+            return fallback
+    except TypeError:
+        pass
+    text = str(value).strip()
+    return text or fallback
+
+
 def render_sidebar() -> dict[str, object]:
     st.sidebar.header("Настройки анализа")
     use_demo_data = st.sidebar.checkbox("Использовать демонстрационный набор", value=True)
     include_demo_docs = st.sidebar.checkbox("Подключить демонстрационные документы", value=True)
     use_text_llm = st.sidebar.checkbox("Использовать модель для текста", value=False)
-    use_document_llm = st.sidebar.checkbox("Использовать модель для документов", value=False)
-    use_any_lm = use_text_llm or use_document_llm
-    endpoint = st.sidebar.text_input(
-        "Endpoint",
-        value="http://127.0.0.1:8080/v1/chat/completions",
-        disabled=not use_any_lm,
+    use_document_model = st.sidebar.checkbox("Использовать модель для документов", value=False)
+    text_endpoint = st.sidebar.text_input(
+        "Endpoint текстовой модели",
+        value=DEFAULT_TEXT_ENDPOINT,
+        disabled=not use_text_llm,
     )
-    discovered_models: list[str] = []
-    discovery_error: str | None = None
-    if use_any_lm:
-        discovered_models, discovery_error = discover_lm_studio_models(endpoint)
 
-    if use_any_lm and discovery_error:
-        st.sidebar.warning(
-            "Не удалось получить список моделей из LM Studio. "
-            "Проверьте endpoint и что локальный сервер запущен."
-        )
-    elif use_any_lm:
-        st.sidebar.caption(f"LM Studio доступен. Найдено моделей: {len(discovered_models)}.")
+    available_document_modes = [
+        item for item in DOCUMENT_ANALYSIS_MODE_OPTIONS if use_document_model or item[0] not in DOCUMENT_AI_MODES
+    ]
+    mode_to_label = {value: label for value, label in available_document_modes}
+    label_to_mode = {label: value for value, label in available_document_modes}
+    default_mode = DEFAULT_DOCUMENT_ANALYSIS_MODE if DEFAULT_DOCUMENT_ANALYSIS_MODE in mode_to_label else "pdf_text"
+    selected_mode_label = st.sidebar.selectbox(
+        "Режим анализа документов",
+        options=list(label_to_mode.keys()),
+        index=list(label_to_mode.values()).index(default_mode),
+    )
+    document_mode = label_to_mode[selected_mode_label]
 
-    if use_text_llm:
-        st.sidebar.caption(f"Текстовая модель зафиксирована: `{TEXT_MODEL_ID}`")
-        if discovered_models and TEXT_MODEL_ID not in discovered_models:
-            st.sidebar.warning(
-                f"Модель `{TEXT_MODEL_ID}` не найдена среди загруженных в LM Studio."
-            )
-
-    use_vision_for_documents = use_document_llm
-    if use_document_llm:
-        st.sidebar.caption(f"Модель для документов зафиксирована: `{VISION_MODEL_ID}`")
-        if discovered_models and VISION_MODEL_ID not in discovered_models:
-            st.sidebar.warning(
-                f"Модель `{VISION_MODEL_ID}` не найдена среди загруженных в LM Studio."
-            )
+    document_endpoint = st.sidebar.text_input(
+        "Endpoint vision-модели документов",
+        value=DEFAULT_TEXT_ENDPOINT,
+        disabled=not (use_document_model and document_mode in {"auto", "vision_model"}),
+    )
+    lightonocr_endpoint = st.sidebar.text_input(
+        "Endpoint LightOnOCR",
+        value=DEFAULT_LIGHTONOCR_ENDPOINT,
+        disabled=not (use_document_model and document_mode in {"auto", "lightonocr"}),
+    )
 
     max_document_ai_calls = st.sidebar.slider(
         "Максимум AI-разборов документов",
         min_value=1,
         max_value=20,
         value=10,
-        disabled=not use_document_llm,
+        disabled=not (use_document_model and document_mode in {"auto", "vision_model", "lightonocr"}),
     )
     max_llm_rows = st.sidebar.slider(
         "Максимум LLM-пояснений за запуск",
@@ -387,19 +403,56 @@ def render_sidebar() -> dict[str, object]:
         value=8,
         disabled=not use_text_llm,
     )
+    resolved_lightonocr_model = LIGHTONOCR_MODEL_ID
+
+    if use_text_llm:
+        text_models, text_error = discover_lm_studio_models(text_endpoint)
+        st.sidebar.caption(f"Текстовая модель зафиксирована: `{TEXT_MODEL_ID}`")
+        if text_error:
+            st.sidebar.warning(
+                "Не удалось получить список текстовых моделей. Проверьте endpoint и локальный сервер."
+            )
+        elif text_models and TEXT_MODEL_ID not in text_models:
+            st.sidebar.warning(f"Модель `{TEXT_MODEL_ID}` не найдена на endpoint текстовой модели.")
+
+    if use_document_model:
+        st.sidebar.caption(f"Режим документов: `{selected_mode_label}`")
+        if document_mode in {"auto", "vision_model"}:
+            document_models, document_error = discover_lm_studio_models(document_endpoint)
+            st.sidebar.caption(f"Vision-модель зафиксирована: `{VISION_MODEL_ID}`")
+            if document_error:
+                st.sidebar.warning("Не удалось получить список vision-моделей документов.")
+            elif document_models and VISION_MODEL_ID not in document_models:
+                st.sidebar.warning(f"Модель `{VISION_MODEL_ID}` не найдена на endpoint документов.")
+
+        if document_mode in {"auto", "lightonocr"}:
+            lighton_models, lighton_error = discover_lm_studio_models(lightonocr_endpoint)
+            resolved_lightonocr_model = resolve_lightonocr_model_identifier(lighton_models)
+            st.sidebar.caption(f"LightOnOCR зафиксирован: `{resolved_lightonocr_model}`")
+            if lighton_error:
+                st.sidebar.warning("Не удалось получить список моделей LightOnOCR.")
+            elif lighton_models and resolved_lightonocr_model not in lighton_models:
+                st.sidebar.warning("Не удалось автоматически подобрать модель LightOnOCR на endpoint.")
+    else:
+        st.sidebar.caption("Без AI-модели документы разбираются через `PDF text`, `Tesseract` и fallback.")
+
     st.sidebar.caption(
-        "При недоступности OCR или локальной модели система продолжит работу с офлайн-фолбэками."
+        "При недоступности OCR или локальной модели система автоматически продолжит работу с fallback-разбором."
     )
     return {
         "use_demo_data": use_demo_data,
         "include_demo_docs": include_demo_docs,
         "ai_settings": AISettings(
             use_lm_studio=use_text_llm,
-            endpoint=endpoint,
+            endpoint=text_endpoint,
             model=TEXT_MODEL_ID,
             max_rows=max_llm_rows,
-            use_vision_for_documents=use_vision_for_documents,
-            vision_model=VISION_MODEL_ID,
+            use_document_model=use_document_model,
+            document_analysis_mode=document_mode,
+            document_endpoint=document_endpoint,
+            document_model=VISION_MODEL_ID,
+            lightonocr_endpoint=lightonocr_endpoint,
+            lightonocr_model=resolved_lightonocr_model,
             max_document_ai_calls=max_document_ai_calls,
         ),
     }
@@ -543,7 +596,28 @@ def render_results(state: dict[str, object]) -> None:
             st.dataframe(documents_df, use_container_width=True, hide_index=True)
             selected_doc_name = st.selectbox("Просмотр извлеченного текста", documents_df["file_name"].tolist())
             selected_doc = documents_df.loc[documents_df["file_name"] == selected_doc_name].iloc[0]
-            st.text_area("Извлеченный текст", selected_doc["extracted_text"], height=260)
+            doc_col, text_col = st.columns((0.95, 1.05))
+            with doc_col:
+                st.markdown(
+                    f"""
+                    <div class="section-card">
+                        <h3>Карточка документа</h3>
+                        <p><strong>Файл:</strong> {display_value(selected_doc['file_name'])}</p>
+                        <p><strong>Способ извлечения:</strong> {display_value(selected_doc['extraction_method'])}</p>
+                        <p><strong>Уверенность:</strong> {display_value(selected_doc['confidence'])}</p>
+                        <p><strong>Номер документа:</strong> {display_value(selected_doc['document_number'])}</p>
+                        <p><strong>Дата документа:</strong> {display_value(selected_doc['document_date'])}</p>
+                        <p><strong>Контрагент:</strong> {display_value(selected_doc['counterparty'])}</p>
+                        <p><strong>Сумма:</strong> {display_value(selected_doc['amount'])}</p>
+                        <p><strong>Валюта:</strong> {display_value(selected_doc['currency'])}</p>
+                        <p><strong>Описание:</strong> {display_value(selected_doc['description'])}</p>
+                        <p><strong>Предупреждения:</strong> {display_value(selected_doc['warnings'], fallback='нет')}</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            with text_col:
+                st.text_area("Извлеченный текст", display_value(selected_doc["extracted_text"], fallback=""), height=320)
 
     with tabs[3]:
         st.subheader("Итоговое заключение")

@@ -8,6 +8,31 @@ WORKSPACE_DIR = PROJECT_ROOT / "workspace"
 REPORT_DIR = WORKSPACE_DIR / "reports"
 DEMO_DATA_DIR = PROJECT_ROOT / "sample_data"
 
+DEFAULT_TEXT_ENDPOINT = "http://127.0.0.1:8080/v1/chat/completions"
+DEFAULT_DOCUMENT_ENDPOINT = DEFAULT_TEXT_ENDPOINT
+DEFAULT_LIGHTONOCR_ENDPOINT = DEFAULT_TEXT_ENDPOINT
+
+TEXT_MODEL_ID = "qwen2.5-7b-instruct"
+VISION_MODEL_ID = "qwen2.5-vl-7b-instruct"
+LIGHTONOCR_MODEL_ID = "lightonocr-2-1b"
+LIGHTONOCR_MODEL_CANDIDATES = [
+    "lightonocr-2-1b",
+    "lightonai/LightOnOCR-2-1B",
+]
+
+DEFAULT_DOCUMENT_ANALYSIS_MODE = "auto"
+DOCUMENT_ANALYSIS_MODE_OPTIONS = [
+    ("auto", "Auto"),
+    ("pdf_text", "PDF text"),
+    ("tesseract", "Tesseract"),
+    ("vision_model", "Vision model"),
+    ("lightonocr", "LightOnOCR"),
+]
+DOCUMENT_AI_MODES = {"vision_model", "lightonocr"}
+LIGHTONOCR_RENDER_DPI = 200
+LIGHTONOCR_TARGET_MAX_DIMENSION = 1540
+LIGHTONOCR_MAX_PAGES = 3
+
 SUPPORTED_DOCUMENT_TYPES = {".pdf", ".png", ".jpg", ".jpeg"}
 
 CANONICAL_FIELDS = [

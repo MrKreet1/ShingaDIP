@@ -9,20 +9,35 @@ from urllib.parse import urlsplit, urlunsplit
 
 import pandas as pd
 
+from shingadip.config import (
+    DEFAULT_DOCUMENT_ANALYSIS_MODE,
+    DEFAULT_DOCUMENT_ENDPOINT,
+    DEFAULT_LIGHTONOCR_ENDPOINT,
+    DEFAULT_TEXT_ENDPOINT,
+    LIGHTONOCR_MODEL_ID,
+    LIGHTONOCR_MODEL_CANDIDATES,
+    TEXT_MODEL_ID,
+    VISION_MODEL_ID,
+)
+
 
 @dataclass(slots=True)
 class AISettings:
     use_lm_studio: bool = False
-    endpoint: str = "http://127.0.0.1:8080/v1/chat/completions"
-    model: str = "qwen2.5-7b-instruct"
+    endpoint: str = DEFAULT_TEXT_ENDPOINT
+    model: str = TEXT_MODEL_ID
     timeout_seconds: int = 20
     max_rows: int = 8
-    use_vision_for_documents: bool = False
-    vision_model: str = "qwen2.5-vl-7b-instruct"
+    use_document_model: bool = False
+    document_analysis_mode: str = DEFAULT_DOCUMENT_ANALYSIS_MODE
+    document_endpoint: str = DEFAULT_DOCUMENT_ENDPOINT
+    document_model: str = VISION_MODEL_ID
+    lightonocr_endpoint: str = DEFAULT_LIGHTONOCR_ENDPOINT
+    lightonocr_model: str = LIGHTONOCR_MODEL_ID
     max_document_ai_calls: int = 10
 
 
-def discover_lm_studio_models(endpoint: str, timeout_seconds: int = 5) -> tuple[list[str], str | None]:
+def discover_openai_models(endpoint: str, timeout_seconds: int = 5) -> tuple[list[str], str | None]:
     models_url = _models_url_from_chat_endpoint(endpoint)
     try:
         with urllib.request.urlopen(models_url, timeout=timeout_seconds) as response:
@@ -34,6 +49,77 @@ def discover_lm_studio_models(endpoint: str, timeout_seconds: int = 5) -> tuple[
         return [], str(exc)
 
 
+def discover_lm_studio_models(endpoint: str, timeout_seconds: int = 5) -> tuple[list[str], str | None]:
+    return discover_openai_models(endpoint, timeout_seconds=timeout_seconds)
+
+
+def resolve_model_identifier(
+    available_models: list[str],
+    preferred: str,
+    *,
+    fallbacks: list[str] | None = None,
+    contains_patterns: list[str] | None = None,
+) -> str:
+    if not available_models:
+        return preferred
+
+    normalized_map = {model.lower(): model for model in available_models}
+    direct_candidates = [preferred, *(fallbacks or [])]
+    for candidate in direct_candidates:
+        resolved = normalized_map.get(candidate.lower())
+        if resolved:
+            return resolved
+
+    patterns = [item.lower() for item in (contains_patterns or []) if item]
+    for model in available_models:
+        lowered = model.lower()
+        if any(pattern in lowered for pattern in patterns):
+            return model
+
+    return preferred
+
+
+def resolve_lightonocr_model_identifier(available_models: list[str]) -> str:
+    return resolve_model_identifier(
+        available_models,
+        LIGHTONOCR_MODEL_ID,
+        fallbacks=LIGHTONOCR_MODEL_CANDIDATES,
+        contains_patterns=["lightonocr"],
+    )
+
+
+def request_openai_chat_completion(
+    messages: list[dict[str, object]],
+    *,
+    endpoint: str,
+    model: str,
+    timeout_seconds: int,
+    temperature: float = 0.2,
+    max_tokens: int | None = None,
+) -> str | None:
+    payload: dict[str, object] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            raw_body = response.read().decode("utf-8")
+        decoded = json.loads(raw_body)
+        return decoded["choices"][0]["message"]["content"]
+    except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError, ValueError):
+        return None
+
+
 def request_lm_studio_completion(
     messages: list[dict[str, object]],
     settings: AISettings,
@@ -42,27 +128,39 @@ def request_lm_studio_completion(
     temperature: float = 0.2,
     max_tokens: int | None = None,
 ) -> str | None:
-    payload: dict[str, object] = {
-        "model": model or settings.model,
-        "messages": messages,
-        "temperature": temperature,
-    }
-    if max_tokens is not None:
-        payload["max_tokens"] = max_tokens
-
-    request = urllib.request.Request(
-        settings.endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    return request_openai_chat_completion(
+        messages,
+        endpoint=settings.endpoint,
+        model=model or settings.model,
+        timeout_seconds=settings.timeout_seconds,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
-    try:
-        with urllib.request.urlopen(request, timeout=settings.timeout_seconds) as response:
-            raw_body = response.read().decode("utf-8")
-        decoded = json.loads(raw_body)
-        return decoded["choices"][0]["message"]["content"]
-    except (urllib.error.URLError, TimeoutError, KeyError, json.JSONDecodeError, ValueError):
-        return None
+
+
+def request_document_model_completion(
+    messages: list[dict[str, object]],
+    settings: AISettings,
+    *,
+    backend: str,
+    temperature: float = 0.2,
+    max_tokens: int | None = None,
+) -> str | None:
+    if backend == "lightonocr":
+        endpoint = settings.lightonocr_endpoint
+        model = settings.lightonocr_model
+    else:
+        endpoint = settings.document_endpoint
+        model = settings.document_model
+
+    return request_openai_chat_completion(
+        messages,
+        endpoint=endpoint,
+        model=model,
+        timeout_seconds=settings.timeout_seconds,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
 
 
 def extract_json_object(raw_text: str) -> dict[str, object] | None:
