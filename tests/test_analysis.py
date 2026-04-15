@@ -213,6 +213,58 @@ class AnalysisTests(unittest.TestCase):
         self.assertTrue(str(row["recommended_action"]).strip())
         self.assertEqual(row["ai_comment"], row["short_ai_comment"])
 
+    def test_analysis_exposes_risk_score_breakdown(self) -> None:
+        frame = standardize_operations(
+            pd.DataFrame(
+                [
+                    {
+                        "Дата операции": "2026-04-11",
+                        "Номер документа": "INV-8801",
+                        "Контрагент": "TOO Rare Vendor",
+                        "Сумма": "2250000",
+                        "Описание операции": "",
+                    },
+                    {
+                        "Дата операции": "2026-04-12",
+                        "Номер документа": "INV-8802",
+                        "Контрагент": "TOO Stable Vendor",
+                        "Сумма": "120000",
+                        "Описание операции": "Обычная поставка",
+                    },
+                    {
+                        "Дата операции": "2026-04-13",
+                        "Номер документа": "INV-8803",
+                        "Контрагент": "TOO Stable Vendor",
+                        "Сумма": "118000",
+                        "Описание операции": "Обычная поставка",
+                    },
+                    {
+                        "Дата операции": "2026-04-14",
+                        "Номер документа": "INV-8804",
+                        "Контрагент": "TOO Stable Vendor",
+                        "Сумма": "117000",
+                        "Описание операции": "Обычная поставка",
+                    },
+                    {
+                        "Дата операции": "2026-04-15",
+                        "Номер документа": "INV-8805",
+                        "Контрагент": "TOO Stable Vendor",
+                        "Сумма": "119000",
+                        "Описание операции": "Обычная поставка",
+                    },
+                ]
+            )
+        )
+        result = analyze_operations(frame, [])
+        row = result.loc[result["document_number"] == "INV-8801"].iloc[0]
+
+        self.assertIn("score_missing_fields", row.index)
+        self.assertIn("score_amount", row.index)
+        self.assertIn("risk_score_breakdown_json", row.index)
+        self.assertTrue(int(row["score_missing_fields"]) > 0)
+        self.assertTrue(int(row["score_amount"]) > 0)
+        self.assertTrue(str(row["risk_score_top_contributors"]).strip())
+
     def test_extract_document_lightonocr_image_success(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             image_path = Path(temp_dir) / "INV-3301.png"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import re
 from difflib import SequenceMatcher
@@ -9,6 +10,20 @@ from sklearn.ensemble import IsolationForest
 
 from shingadip.config import RISK_WEIGHTS, SUSPICIOUS_DESCRIPTION_KEYWORDS
 from shingadip.documents import DocumentExtraction
+
+
+RISK_SCORE_COMPONENT_LABELS = {
+    "score_missing_fields": "Пропущенные обязательные поля",
+    "score_duplicate": "Дубликаты номера документа",
+    "score_description": "Подозрительное описание",
+    "score_amount": "Нетипично большая сумма",
+    "score_document": "Документарные расхождения",
+    "score_ml": "ML-анализ аномалий",
+    "score_counterparty": "Нетипичный контрагент",
+    "score_compound_bonus": "Комбинация факторов риска",
+    "score_threshold_adjustment": "Пороговая корректировка статуса",
+    "score_cap_adjustment": "Ограничение итогового балла",
+}
 
 
 def normalize_token(value: object) -> str:
@@ -141,7 +156,7 @@ def analyze_operations(
     has_uploaded_documents = bool(documents)
     scored = detect_ml_anomalies(operations_df)
     duplicate_counts = scored["document_number"].fillna("").map(normalize_token).value_counts().to_dict()
-    counterparty_counts = scored["counterparty"].fillna("не указан").value_counts(dropna=False).to_dict()
+    counterparty_counts = scored["counterparty"].fillna("не указано").value_counts(dropna=False).to_dict()
 
     amounts = scored["amount"].dropna()
     if len(amounts) >= 4:
@@ -160,6 +175,7 @@ def analyze_operations(
         reasons: list[str] = []
         reason_codes: list[str] = []
         risk_score = 0
+        score_breakdown = {key: 0 for key in RISK_SCORE_COMPONENT_LABELS}
         document_check_status = "NOT_PROVIDED" if not has_uploaded_documents else "OK"
 
         missing_fields = row.get("missing_required_fields", [])
@@ -167,35 +183,47 @@ def analyze_operations(
             reason_codes.append("missing_required_fields")
             missing_names = ", ".join(_translate_field_name(field) for field in missing_fields)
             reasons.append(f"Отсутствуют обязательные поля: {missing_names}.")
-            risk_score += RISK_WEIGHTS["missing_required_fields"] + min(len(missing_fields) * 2, 8)
+            missing_score = RISK_WEIGHTS["missing_required_fields"] + min(len(missing_fields) * 2, 8)
+            risk_score += missing_score
+            score_breakdown["score_missing_fields"] += missing_score
 
         document_key = normalize_token(row.get("document_number"))
         if document_key and duplicate_counts.get(document_key, 0) > 1:
             reason_codes.append("duplicate_document_number")
             reasons.append("Номер документа встречается в таблице более одного раза.")
-            risk_score += RISK_WEIGHTS["duplicate_document_number"]
+            duplicate_score = RISK_WEIGHTS["duplicate_document_number"]
+            risk_score += duplicate_score
+            score_breakdown["score_duplicate"] += duplicate_score
 
         description = (row.get("description") or "").lower()
         if any(keyword in description for keyword in SUSPICIOUS_DESCRIPTION_KEYWORDS):
             reason_codes.append("suspicious_description")
             reasons.append("Описание операции содержит нетипичные или рискованные формулировки.")
-            risk_score += RISK_WEIGHTS["suspicious_description"]
+            description_score = RISK_WEIGHTS["suspicious_description"]
+            risk_score += description_score
+            score_breakdown["score_description"] += description_score
 
         if row.get("amount") is not None and row["amount"] > high_amount_threshold:
             reason_codes.append("amount_outlier")
             reasons.append("Сумма операции значительно выше типового диапазона.")
-            risk_score += RISK_WEIGHTS["amount_outlier"]
+            amount_score = RISK_WEIGHTS["amount_outlier"]
+            risk_score += amount_score
+            score_breakdown["score_amount"] += amount_score
 
         if matched_document is None and has_uploaded_documents:
             reason_codes.append("no_primary_document")
             reasons.append("Не найден подходящий первичный документ для сверки.")
-            risk_score += RISK_WEIGHTS["no_primary_document"]
+            missing_doc_score = RISK_WEIGHTS["no_primary_document"]
+            risk_score += missing_doc_score
+            score_breakdown["score_document"] += missing_doc_score
             document_check_status = "MISSING"
         elif matched_document is not None:
             if matched_document.amount is None or matched_document.document_date is None:
                 reason_codes.append("document_incomplete")
                 reasons.append("Документ загружен, но извлеченные реквизиты неполные.")
-                risk_score += RISK_WEIGHTS["document_incomplete"]
+                incomplete_score = RISK_WEIGHTS["document_incomplete"]
+                risk_score += incomplete_score
+                score_breakdown["score_document"] += incomplete_score
                 document_check_status = "PARTIAL"
 
             if row.get("amount") is not None and matched_document.amount is not None:
@@ -204,27 +232,35 @@ def analyze_operations(
                 if amount_difference > tolerance:
                     reason_codes.append("document_amount_mismatch")
                     reasons.append("Сумма операции не совпадает с суммой в первичном документе.")
-                    risk_score += RISK_WEIGHTS["document_amount_mismatch"]
+                    mismatch_score = RISK_WEIGHTS["document_amount_mismatch"]
+                    risk_score += mismatch_score
+                    score_breakdown["score_document"] += mismatch_score
                     document_check_status = "MISMATCH"
 
             if row.get("operation_date") is not None and matched_document.document_date is not None:
                 if row["operation_date"] != matched_document.document_date:
                     reason_codes.append("document_date_mismatch")
                     reasons.append("Дата операции не совпадает с датой первичного документа.")
-                    risk_score += RISK_WEIGHTS["document_date_mismatch"]
+                    date_score = RISK_WEIGHTS["document_date_mismatch"]
+                    risk_score += date_score
+                    score_breakdown["score_document"] += date_score
                     document_check_status = "MISMATCH"
 
             similarity = text_similarity(row.get("counterparty"), matched_document.counterparty)
             if matched_document.counterparty and similarity < 0.65:
                 reason_codes.append("document_counterparty_mismatch")
                 reasons.append("Контрагент в учете отличается от контрагента в документе.")
-                risk_score += RISK_WEIGHTS["document_counterparty_mismatch"]
+                counterparty_mismatch_score = RISK_WEIGHTS["document_counterparty_mismatch"]
+                risk_score += counterparty_mismatch_score
+                score_breakdown["score_document"] += counterparty_mismatch_score
                 document_check_status = "MISMATCH"
 
         if bool(row.get("ml_anomaly_flag")):
             reason_codes.append("ml_anomaly")
             reasons.append("Модель аномалий отметила операцию как нетипичную относительно остальных записей.")
-            risk_score += int(RISK_WEIGHTS["ml_anomaly"] * float(row.get("ml_anomaly_strength", 0.0) or 0.0) + 4)
+            ml_score = int(RISK_WEIGHTS["ml_anomaly"] * float(row.get("ml_anomaly_strength", 0.0) or 0.0) + 4)
+            risk_score += ml_score
+            score_breakdown["score_ml"] += ml_score
 
         counterparty = row.get("counterparty")
         rare_counterparty_support = {
@@ -244,7 +280,9 @@ def analyze_operations(
         ):
             reason_codes.append("atypical_counterparty")
             reasons.append("Контрагент встречается редко и усиливает общий риск операции.")
-            risk_score += RISK_WEIGHTS["atypical_counterparty"]
+            counterparty_score = RISK_WEIGHTS["atypical_counterparty"]
+            risk_score += counterparty_score
+            score_breakdown["score_counterparty"] += counterparty_score
 
         compound_risk_factors = {
             "missing_required_fields",
@@ -259,9 +297,12 @@ def analyze_operations(
         compound_count = len(compound_risk_factors.intersection(reason_codes))
         if compound_count >= 4:
             risk_score += 16
+            score_breakdown["score_compound_bonus"] += 16
         elif compound_count >= 3:
             risk_score += 10
+            score_breakdown["score_compound_bonus"] += 10
 
+        pre_threshold_score = risk_score
         if "document_amount_mismatch" in reason_codes:
             risk_score = max(risk_score, 45)
         elif "no_primary_document" in reason_codes:
@@ -273,8 +314,12 @@ def analyze_operations(
             "missing_required_fields",
         }.intersection(reason_codes):
             risk_score = max(risk_score, 30)
+        score_breakdown["score_threshold_adjustment"] += max(risk_score - pre_threshold_score, 0)
 
-        risk_score = min(int(round(risk_score)), 100)
+        rounded_score = int(round(risk_score))
+        final_score = min(rounded_score, 100)
+        score_breakdown["score_cap_adjustment"] += final_score - rounded_score
+        risk_score = final_score
         if risk_score >= 70:
             status = "RISK"
         elif risk_score >= 30:
@@ -302,6 +347,9 @@ def analyze_operations(
                 "matched_document_counterparty": matched_document.counterparty if matched_document else None,
                 "matched_document_confidence": round(match_score, 2) if matched_document else 0.0,
                 "document_check_status": document_check_status,
+                **score_breakdown,
+                "risk_score_breakdown_json": json.dumps(score_breakdown, ensure_ascii=False),
+                "risk_score_top_contributors": _build_top_score_contributors(score_breakdown),
             }
         )
 
@@ -318,3 +366,15 @@ def _translate_field_name(field_name: str) -> str:
         "description": "описание операции",
     }
     return translations.get(field_name, field_name)
+
+
+def _build_top_score_contributors(score_breakdown: dict[str, int]) -> str:
+    ranked = [
+        (RISK_SCORE_COMPONENT_LABELS[key], value)
+        for key, value in score_breakdown.items()
+        if value and key != "score_cap_adjustment"
+    ]
+    ranked.sort(key=lambda item: (-int(item[1]), item[0]))
+    if not ranked:
+        return "существенные вклады не выявлены"
+    return "; ".join(f"{label}: {value}" for label, value in ranked[:3])

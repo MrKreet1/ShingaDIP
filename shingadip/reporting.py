@@ -54,9 +54,7 @@ def build_summary(results_df: pd.DataFrame, documents: list[DocumentExtraction])
 
     reason_summary = build_reason_summary(results_df)
     top_reason_text = (
-        ", ".join(reason_summary["Причина"].head(3).tolist())
-        if not reason_summary.empty
-        else "существенные отклонения не выявлены"
+        ", ".join(reason_summary["Причина"].head(3).tolist()) if not reason_summary.empty else "существенные отклонения не выявлены"
     )
 
     counterparty_summary = build_counterparty_summary(results_df)
@@ -112,9 +110,7 @@ def build_audit_conclusion(
     ai_comment = summary.get("dataset_comment") or recommendation
     report_tables = report_tables or build_report_tables(results_df, summary)
     risk_register = report_tables.get("risk_register", build_risk_register(results_df))
-    top_risk_operations = []
-    if not risk_register.empty:
-        top_risk_operations = risk_register.head(5).to_dict(orient="records")
+    top_risk_operations = risk_register.head(5).to_dict(orient="records") if not risk_register.empty else []
     coverage_quality = _build_document_coverage_quality(
         summary.get("document_coverage_percent"),
         summary.get("documents_expected_count"),
@@ -168,6 +164,7 @@ def build_risk_register(results_df: pd.DataFrame) -> pd.DataFrame:
                 "Уверенность",
                 "Категория риска",
                 "Ведущий фактор риска",
+                "Топ-вклад в риск-балл",
                 "Причина отклонения",
                 "Рекомендуемое действие",
                 "Статус сверки документа",
@@ -190,6 +187,7 @@ def build_risk_register(results_df: pd.DataFrame) -> pd.DataFrame:
             "confidence",
             "risk_category",
             "primary_risk_driver",
+            "risk_score_top_contributors",
             "reason_details",
             "recommended_action",
             "document_check_status",
@@ -206,6 +204,7 @@ def build_risk_register(results_df: pd.DataFrame) -> pd.DataFrame:
             "confidence": "Уверенность",
             "risk_category": "Категория риска",
             "primary_risk_driver": "Ведущий фактор риска",
+            "risk_score_top_contributors": "Топ-вклад в риск-балл",
             "reason_details": "Причина отклонения",
             "recommended_action": "Рекомендуемое действие",
             "document_check_status": "Статус сверки документа",
@@ -280,17 +279,19 @@ def build_counterparty_summary(results_df: pd.DataFrame) -> pd.DataFrame:
                 "Количество WARNING",
                 "Количество RISK",
                 "Средний риск",
-                "Количество операций без документа",
+                "Количество операций без загруженных документов",
+                "Количество операций с ненайденным документом",
                 "Количество операций с расхождением документа",
             ]
         )
 
     enriched = results_df.copy()
-    enriched["counterparty_report"] = enriched["counterparty"].fillna("не указан")
+    enriched["counterparty_report"] = enriched["counterparty"].fillna("не указано")
     enriched["amount_numeric"] = pd.to_numeric(enriched["amount"], errors="coerce").fillna(0.0)
     enriched["warning_flag"] = enriched["status"] == "WARNING"
     enriched["risk_flag"] = enriched["status"] == "RISK"
-    enriched["no_document_flag"] = enriched["document_check_status"].isin(["MISSING", "NOT_PROVIDED"])
+    enriched["document_not_provided_flag"] = enriched["document_check_status"] == "NOT_PROVIDED"
+    enriched["document_missing_flag"] = enriched["document_check_status"] == "MISSING"
     enriched["document_mismatch_flag"] = enriched["document_check_status"] == "MISMATCH"
 
     grouped = (
@@ -301,7 +302,8 @@ def build_counterparty_summary(results_df: pd.DataFrame) -> pd.DataFrame:
             warning_count=("warning_flag", "sum"),
             risk_count=("risk_flag", "sum"),
             average_risk=("risk_score", "mean"),
-            no_document_count=("no_document_flag", "sum"),
+            not_provided_count=("document_not_provided_flag", "sum"),
+            missing_count=("document_missing_flag", "sum"),
             mismatch_count=("document_mismatch_flag", "sum"),
         )
         .reset_index()
@@ -313,7 +315,8 @@ def build_counterparty_summary(results_df: pd.DataFrame) -> pd.DataFrame:
                 "warning_count": "Количество WARNING",
                 "risk_count": "Количество RISK",
                 "average_risk": "Средний риск",
-                "no_document_count": "Количество операций без документа",
+                "not_provided_count": "Количество операций без загруженных документов",
+                "missing_count": "Количество операций с ненайденным документом",
                 "mismatch_count": "Количество операций с расхождением документа",
             }
         )
@@ -554,7 +557,6 @@ def _build_document_coverage_quality(document_coverage_percent: object, document
 
     if coverage < 0:
         return "не оценивалось"
-
     if coverage >= 80:
         return "высокое"
     if coverage >= 50:

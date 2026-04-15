@@ -326,6 +326,8 @@ def build_row_interpretation_payload(row: pd.Series) -> dict[str, object]:
     top_codes = ranked_codes[:3]
     dominant_codes = ranked_codes[:2]
     missing_fields = _extract_missing_fields(row)
+    score_breakdown = _extract_score_breakdown(row)
+    top_score_contributors = [label for label, _ in score_breakdown[:3]]
     flags = {
         "missing_description": "description" in missing_fields or not str(row.get("description") or "").strip(),
         "missing_required_fields": bool(missing_fields),
@@ -358,6 +360,8 @@ def build_row_interpretation_payload(row: pd.Series) -> dict[str, object]:
         "top_risk_factors": [_reason_label(code) for code in top_codes],
         "dominant_risk_factors": [_reason_label(code) for code in dominant_codes],
         "primary_risk_driver": _reason_label(top_codes[0]) if top_codes else "существенные отклонения не выявлены",
+        "risk_score_breakdown": [{"label": label, "score": score} for label, score in score_breakdown],
+        "top_score_contributors": top_score_contributors,
         "flags": flags,
         "recommended_action_seed": _build_recommended_action_seed(reason_codes, row),
     }
@@ -643,6 +647,28 @@ def _extract_missing_fields(row: pd.Series) -> list[str]:
     if not text:
         return []
     return [item.strip() for item in text.strip("[]").replace("'", "").split(",") if item.strip()]
+
+
+def _extract_score_breakdown(row: pd.Series) -> list[tuple[str, int]]:
+    labels = {
+        "score_missing_fields": "Пропущенные обязательные поля",
+        "score_duplicate": "Дубликаты номера документа",
+        "score_description": "Подозрительное описание",
+        "score_amount": "Нетипичная сумма",
+        "score_document": "Документарные расхождения",
+        "score_ml": "ML-анализ аномалий",
+        "score_counterparty": "Нетипичный контрагент",
+        "score_compound_bonus": "Комбинация факторов риска",
+        "score_threshold_adjustment": "Пороговая корректировка",
+        "score_cap_adjustment": "Ограничение итогового балла",
+    }
+    items = []
+    for column, label in labels.items():
+        value = int(row.get(column, 0) or 0)
+        if value != 0:
+            items.append((label, value))
+    items.sort(key=lambda item: (-item[1], item[0]))
+    return items
 
 
 def _rank_reason_codes(reason_codes: list[str]) -> list[str]:

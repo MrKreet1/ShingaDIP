@@ -26,7 +26,12 @@ from shingadip.config import (
     VISION_MODEL_ID,
     ensure_workspace,
 )
-from shingadip.data_processing import prepare_run_directory, read_operations_file
+from shingadip.data_processing import (
+    IMPORT_MODE_OPTIONS,
+    get_import_mode_label,
+    load_operations_source,
+    prepare_run_directory,
+)
 from shingadip.documents import extract_documents
 from shingadip.reporting import (
     build_audit_conclusion,
@@ -355,6 +360,52 @@ def display_value(value: object, fallback: str = "не найдено") -> str:
     return text or fallback
 
 
+IMPORT_MODE_LABEL_TO_VALUE = {label: value for value, label in IMPORT_MODE_OPTIONS}
+IMPORT_MODE_VALUE_TO_LABEL = {value: label for value, label in IMPORT_MODE_OPTIONS}
+IMPORT_MAPPING_FIELDS = [
+    ("operation_date", "Колонка даты операции"),
+    ("document_number", "Колонка номера документа"),
+    ("counterparty", "Колонка контрагента"),
+    ("amount", "Колонка суммы"),
+    ("description", "Колонка описания"),
+    ("account", "Колонка счета"),
+]
+RISK_COMPONENT_COLUMNS = [
+    ("score_missing_fields", "Пропущенные обязательные поля"),
+    ("score_duplicate", "Дубликаты номера документа"),
+    ("score_description", "Подозрительное описание"),
+    ("score_amount", "Нетипичная сумма"),
+    ("score_document", "Документарные расхождения"),
+    ("score_ml", "ML-анализ аномалий"),
+    ("score_counterparty", "Нетипичный контрагент"),
+    ("score_compound_bonus", "Комбинация факторов риска"),
+    ("score_threshold_adjustment", "Пороговая корректировка"),
+    ("score_cap_adjustment", "Ограничение итогового балла"),
+]
+
+
+def build_import_preview(
+    operations_file: object | None,
+    import_mode: str,
+    column_mapping: dict[str, str] | None = None,
+):
+    if operations_file is None:
+        return None
+    return load_operations_source(operations_file, import_mode=import_mode, column_mapping=column_mapping)
+
+
+def build_risk_breakdown_frame(row: pd.Series) -> pd.DataFrame:
+    entries = []
+    for column, label in RISK_COMPONENT_COLUMNS:
+        value = int(row.get(column, 0) or 0)
+        if value != 0:
+            entries.append({"Фактор": label, "Баллы": value})
+    if not entries:
+        entries.append({"Фактор": "Существенные вклады не выявлены", "Баллы": 0})
+    frame = pd.DataFrame(entries)
+    return frame.sort_values(["Баллы", "Фактор"], ascending=[False, True]).reset_index(drop=True)
+
+
 def _style_status_cell(value: object) -> str:
     text = str(value or "").strip().upper()
     if text == "RISK":
@@ -519,8 +570,8 @@ def render_uploads() -> tuple[object | None, list[object]]:
     with operations_col:
         st.subheader("Таблица операций")
         operations_file = st.file_uploader(
-            "CSV или XLSX",
-            type=["csv", "xlsx"],
+            "CSV или Excel",
+            type=["csv", "xls", "xlsx"],
             key="operations_uploader",
         )
     with docs_col:
@@ -532,6 +583,87 @@ def render_uploads() -> tuple[object | None, list[object]]:
             key="documents_uploader",
         )
     return operations_file, documents or []
+
+
+def render_uploads_v2() -> tuple[object | None, list[object], str, dict[str, str], object | None]:
+    operations_col, docs_col = st.columns((1.1, 1))
+    import_preview = None
+    manual_mapping: dict[str, str] = {}
+    import_mode = "auto"
+
+    with operations_col:
+        st.subheader("Таблица операций")
+        operations_file = st.file_uploader(
+            "CSV или Excel",
+            type=["csv", "xls", "xlsx"],
+            key="operations_uploader_v2",
+        )
+        import_mode_label = st.selectbox(
+            "Режим импорта операций",
+            options=list(IMPORT_MODE_LABEL_TO_VALUE.keys()),
+            index=list(IMPORT_MODE_LABEL_TO_VALUE.keys()).index("Авто"),
+            key="operations_import_mode_v2",
+        )
+        import_mode = IMPORT_MODE_LABEL_TO_VALUE[import_mode_label]
+
+        if operations_file is not None:
+            try:
+                import_preview = build_import_preview(operations_file, import_mode=import_mode)
+                st.caption(
+                    f"Распознано как: {get_import_mode_label(import_preview.detected_mode)} | "
+                    f"Используется режим: {import_preview.display_name}"
+                )
+                if import_preview.header_row_index is not None:
+                    st.caption(f"Строка заголовков: {import_preview.header_row_index + 1}")
+                if import_preview.period_label:
+                    st.caption(f"Период источника: {import_preview.period_label}")
+                if import_preview.source_note:
+                    st.info(import_preview.source_note)
+                for warning in import_preview.warnings:
+                    st.warning(warning)
+
+                if import_preview.available_columns and import_preview.resolved_mode != "osv_summary":
+                    with st.expander("Ручное сопоставление колонок", expanded=False):
+                        for field_name, label in IMPORT_MAPPING_FIELDS:
+                            default_value = import_preview.applied_mapping.get(field_name)
+                            options = ["Авто"] + import_preview.available_columns
+                            default_index = options.index(default_value) if default_value in options else 0
+                            selected = st.selectbox(
+                                label,
+                                options=options,
+                                index=default_index,
+                                key=f"mapping_{field_name}_v2",
+                            )
+                            if selected != "Авто":
+                                manual_mapping[field_name] = selected
+                    if manual_mapping:
+                        import_preview = build_import_preview(
+                            operations_file,
+                            import_mode=import_mode,
+                            column_mapping=manual_mapping,
+                        )
+
+                with st.expander("Предпросмотр импорта", expanded=True):
+                    preview_col, normalized_col = st.columns((1, 1))
+                    with preview_col:
+                        st.caption("Исходная структура файла")
+                        st.dataframe(import_preview.raw_preview, use_container_width=True, hide_index=True)
+                    with normalized_col:
+                        st.caption("Нормализованная структура для анализа")
+                        st.dataframe(import_preview.normalized_preview, use_container_width=True, hide_index=True)
+            except Exception as exc:
+                st.error(f"Не удалось подготовить импорт: {exc}")
+                import_preview = None
+
+    with docs_col:
+        st.subheader("Первичные документы")
+        documents = st.file_uploader(
+            "PDF или изображения",
+            type=[suffix.lstrip(".") for suffix in sorted(SUPPORTED_DOCUMENT_TYPES)],
+            accept_multiple_files=True,
+            key="documents_uploader_v2",
+        )
+    return operations_file, documents or [], import_mode, manual_mapping, import_preview
 
 
 def run_analysis(
@@ -568,6 +700,51 @@ def run_analysis(
         "report_tables": report_tables,
         "audit_conclusion": audit_conclusion,
         "report_paths": report_paths,
+    }
+
+
+def run_analysis_v2(
+    operations_source: object,
+    document_sources: list[object],
+    ai_settings: AISettings,
+    source_label: str,
+    import_mode: str,
+    column_mapping: dict[str, str] | None = None,
+) -> None:
+    ensure_workspace()
+    run_dir = prepare_run_directory()
+    import_result = load_operations_source(
+        operations_source,
+        import_mode=import_mode,
+        column_mapping=column_mapping,
+    )
+    operations_df = import_result.dataframe
+    extracted_documents = extract_documents(document_sources, run_dir / "documents", ai_settings)
+    results_df = analyze_operations(operations_df, extracted_documents)
+    results_df = generate_row_commentary(results_df, ai_settings)
+    summary = build_summary(results_df, extracted_documents)
+    report_tables = build_report_tables(results_df, summary)
+    summary["dataset_comment"] = generate_dataset_conclusion(summary, report_tables, ai_settings)
+    audit_conclusion = build_audit_conclusion(summary, results_df, report_tables)
+    report_paths = save_report_bundle(
+        results_df,
+        summary,
+        run_dir / "reports",
+        report_tables=report_tables,
+        audit_conclusion=audit_conclusion,
+    )
+
+    st.session_state["analysis_state"] = {
+        "source_label": source_label,
+        "run_dir": str(run_dir),
+        "operations_df": operations_df,
+        "documents_df": pd.DataFrame([doc.to_record() for doc in extracted_documents]),
+        "results_df": results_df,
+        "summary": summary,
+        "report_tables": report_tables,
+        "audit_conclusion": audit_conclusion,
+        "report_paths": report_paths,
+        "import_info": import_result.to_state(),
     }
 
 
@@ -821,11 +998,94 @@ def render_results(state: dict[str, object]) -> None:
         )
 
 
+def render_results_v2(state: dict[str, object]) -> None:
+    render_results(state)
+
+    results_df: pd.DataFrame = state["results_df"]
+    import_info = state.get("import_info", {})
+    detected_mode_text = get_import_mode_label(str(import_info.get("detected_mode", "") or ""))
+    resolved_mode_text = display_value(import_info.get("display_name"), fallback="не определено")
+    header_row_text = (
+        str(int(import_info["header_row_index"]) + 1)
+        if import_info.get("header_row_index") is not None
+        else "не определено"
+    )
+
+    st.markdown("---")
+    st.subheader("Мастер импорта")
+    import_meta_col, preview_col = st.columns((0.8, 1.2))
+    with import_meta_col:
+        st.markdown(
+            f"""
+            <div class="section-card">
+                <h3>Распознанный источник</h3>
+                <p><strong>Определено автоматически:</strong> {display_value(import_info.get('detected_mode'), fallback='не определено')}</p>
+                <p><strong>Использованный режим:</strong> {display_value(import_info.get('display_name'), fallback='не определено')}</p>
+                <p><strong>Сводный источник:</strong> {'Да' if import_info.get('source_is_summary') else 'Нет'}</p>
+                <p><strong>Строка заголовков:</strong> {display_value(import_info.get('header_row_index'), fallback='не определено')}</p>
+                <p><strong>Период:</strong> {display_value(import_info.get('period_label'), fallback='не указан')}</p>
+                <p><strong>Комментарий:</strong> {display_value(import_info.get('source_note'), fallback='нет')}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        warnings = import_info.get("warnings", [])
+        for warning in warnings:
+            st.warning(warning)
+    with preview_col:
+        raw_preview = import_info.get("raw_preview")
+        normalized_preview = import_info.get("normalized_preview")
+        preview_tabs = st.tabs(["Исходная структура", "Нормализованная структура"])
+        with preview_tabs[0]:
+            if isinstance(raw_preview, pd.DataFrame) and not raw_preview.empty:
+                st.dataframe(raw_preview, use_container_width=True, hide_index=True)
+            else:
+                st.info("Предпросмотр исходной структуры недоступен.")
+        with preview_tabs[1]:
+            if isinstance(normalized_preview, pd.DataFrame) and not normalized_preview.empty:
+                st.dataframe(normalized_preview, use_container_width=True, hide_index=True)
+            else:
+                st.info("Нормализованная структура недоступна.")
+
+    st.subheader("Расшифровка риск-балла")
+    selectable = results_df.sort_values(["risk_score", "operation_id"], ascending=[False, True])
+    labels = selectable.apply(
+        lambda row: f"{row['operation_id']} | {row['document_number'] or 'без номера'} | {row['status']}",
+        axis=1,
+    )
+    selected_label = st.selectbox(
+        "Операция для разбора риск-балла",
+        labels.tolist(),
+        key="risk_breakdown_selector_v2",
+    )
+    selected_row = selectable.loc[labels == selected_label].iloc[0]
+    breakdown_frame = build_risk_breakdown_frame(selected_row)
+    breakdown_col, chart_col = st.columns((0.95, 1.05))
+    with breakdown_col:
+        st.markdown(
+            f"""
+            <div class="section-card">
+                <h3>Из чего сложился риск-балл</h3>
+                <p><strong>Операция:</strong> {selected_row['operation_id']}</p>
+                <p><strong>Статус:</strong> <span class="{status_css_class(selected_row['status'])}">{selected_row['status']}</span></p>
+                <p><strong>Итоговый риск-балл:</strong> {selected_row['risk_score']}</p>
+                <p><strong>Главные вкладчики:</strong> {display_value(selected_row.get('risk_score_top_contributors'))}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.dataframe(breakdown_frame, use_container_width=True, hide_index=True)
+    with chart_col:
+        chart_frame = breakdown_frame.set_index("Фактор")
+        st.bar_chart(chart_frame)
+        st.caption("Баллы показывают вклад каждого фактора в итоговый риск-балл операции.")
+
+
 def main() -> None:
     inject_styles()
     settings = render_sidebar()
     render_header()
-    operations_file, uploaded_docs = render_uploads()
+    operations_file, uploaded_docs, import_mode, manual_mapping, import_preview = render_uploads_v2()
     run_clicked = render_run_block()
 
     if run_clicked:
@@ -845,17 +1105,19 @@ def main() -> None:
         if operations_source is None:
             st.error("Загрузите файл операций или включите демонстрационный набор.")
         else:
-            run_analysis(
+            run_analysis_v2(
                 operations_source=operations_source,
                 document_sources=document_sources,
                 ai_settings=settings["ai_settings"],
                 source_label=source_label,
+                import_mode=import_mode,
+                column_mapping=manual_mapping,
             )
             st.success("Анализ завершен. Результаты доступны ниже.")
 
     state = st.session_state.get("analysis_state")
     if state:
-        render_results(state)
+        render_results_v2(state)
     else:
         st.info(
             "После запуска анализа здесь появятся результаты проверки, карточка операции и итоговое заключение."

@@ -46,6 +46,7 @@ class ReportingTests(unittest.TestCase):
                     "short_ai_comment": "Операция не содержит существенных признаков риска.",
                     "full_ai_comment": "Операция оценена как низкорисковая и не требует дополнительной эскалации.",
                     "ai_comment": "OK",
+                    "risk_score_top_contributors": "существенные вклады не выявлены",
                 },
                 {
                     "operation_id": "OP-0002",
@@ -72,6 +73,7 @@ class ReportingTests(unittest.TestCase):
                     "short_ai_comment": "Операция требует проверки из-за отсутствия документа.",
                     "full_ai_comment": "По операции не найден подтверждающий документ, поэтому требуется выборочная ручная проверка.",
                     "ai_comment": "WARNING",
+                    "risk_score_top_contributors": "Документарные расхождения: 8; ML-анализ аномалий: 6",
                 },
                 {
                     "operation_id": "OP-0003",
@@ -98,6 +100,7 @@ class ReportingTests(unittest.TestCase):
                     "short_ai_comment": "Операция имеет высокий риск из-за расхождения с документом.",
                     "full_ai_comment": "Операция классифицирована как рискованная, поскольку сумма и реквизиты не совпадают с документом.",
                     "ai_comment": "RISK",
+                    "risk_score_top_contributors": "Документарные расхождения: 28; ML-анализ аномалий: 12",
                 },
             ]
         )
@@ -119,6 +122,7 @@ class ReportingTests(unittest.TestCase):
                 "Уверенность",
                 "Категория риска",
                 "Ведущий фактор риска",
+                "Топ-вклад в риск-балл",
                 "Причина отклонения",
                 "Рекомендуемое действие",
                 "Статус сверки документа",
@@ -140,7 +144,8 @@ class ReportingTests(unittest.TestCase):
         self.assertEqual(float(beta_row["Общая сумма операций"]), 740000.0)
         self.assertEqual(int(beta_row["Количество WARNING"]), 1)
         self.assertEqual(int(beta_row["Количество RISK"]), 1)
-        self.assertEqual(int(beta_row["Количество операций без документа"]), 1)
+        self.assertEqual(int(beta_row["Количество операций без загруженных документов"]), 0)
+        self.assertEqual(int(beta_row["Количество операций с ненайденным документом"]), 1)
         self.assertEqual(int(beta_row["Количество операций с расхождением документа"]), 1)
 
     def test_build_document_reconciliation_maps_match_flags(self) -> None:
